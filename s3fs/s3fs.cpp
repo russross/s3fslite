@@ -1031,6 +1031,8 @@ s3fs_rename(const char *from, const char *to) {
     VERIFY(get_headers(from, meta));
 
     meta["x-amz-copy-source"] = urlEncode("/"+bucket + from);
+    meta["Content-Type"] = lookupMimeType(to);
+    meta["x-amz-metadata-directive"] = "REPLACE";
 
     int result = put_headers(to, meta);
     if (result != 0)
