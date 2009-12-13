@@ -1,7 +1,8 @@
 s3fslite
 ========
 
-s3fslite is a fork of Randy Rizun's `s3fs`:
+s3fslite is a fork of Randy Rizun's s3fs, a file system that stores
+all data in an Amazon S3 bucket:
 
 * <http://code.google.com/p/s3fs/wiki/FuseOverAmazon>
 
@@ -49,6 +50,14 @@ My usual command to mount a system is:
 This mounts the file system with a file cache, makes stored files
 publicly browsable, and allows all users of the local machine to use
 the mount.
+
+I also put my S3 access key and secret access key in
+`/etc/passwd-s3fs` with the form:
+
+    ACCESSKEY:SECRETACCESSKEY
+
+s3fs knows to look for it there, so you do not have to provide it on
+the command line.
 
 And now for the README that was included with the original code
 (with a few updates):
@@ -176,3 +185,9 @@ couple of limitations:
     needs to be accessed first. A workaround could be to use s3fs's
     cache support with the `-o use_cache` option.
 
+
+License:
+--------
+
+s3fslite retains the original GPL v2 license that s3fs uses. See the
+file `COPYING` for details.
