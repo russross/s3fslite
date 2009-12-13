@@ -3,6 +3,8 @@
  *
  * Copyright 2007-2008 Randy Rizun <rrizun@gmail.com>
  *
+ * Some parts Copyright 2009 Russ Ross <russ@russross.com>
+ *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
  * as published by the Free Software Foundation; either version 2
