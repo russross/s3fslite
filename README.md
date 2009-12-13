@@ -91,12 +91,25 @@ In order to compile s3fs, You'll need the following requirements:
 
 *   OpenSSL-devel (0.9.8)
 
-*   Subversion
-
 *   SQLite 3
 
 If you're using YUM or APT to install those packages, then it might
 require additional packaging, allow it to be installed.
+
+I think this list has everything you need for Ubuntu. I already have
+many of the development packages on my system, so this list may not
+be complete. Please let me know if you discover something that is
+missing:
+
+*   build-essential
+
+*   libxml2-dev
+
+*   libcurl4-openssl-dev
+
+*   libfuse-dev
+
+*   libsqlite3-dev
 
 
 Downloading and compiling:
