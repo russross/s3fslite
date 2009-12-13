@@ -21,6 +21,7 @@
 #define FUSE_USE_VERSION 26
 
 #include <fuse.h>
+#include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -45,8 +46,6 @@
 #include <vector>
 #include <algorithm>
 #include <strings.h>
-
-#include "sqlitecache.h"
 
 using namespace std;
 
@@ -328,10 +327,179 @@ static string use_cache;
 // private, public-read, public-read-write, authenticated-read
 static string default_acl("private");
 
-// key=path
-typedef map<string, struct stat> stat_cache_t;
-static stat_cache_t stat_cache;
-static pthread_mutex_t stat_cache_lock;
+//
+// SQLite attribute caching
+//
+class Cache {
+private:
+    sqlite3 *conn;
+    pthread_mutex_t lock;
+
+public:
+    Cache(std::string &bucket);
+    int get(std::string &path, struct stat *info);
+    int get(const char *path, struct stat *info);
+    void set(std::string &path, struct stat *info);
+    void set(const char *path, struct stat *info);
+    void del(std::string &path);
+    void del(const char *path);
+    ~Cache();
+};
+
+Cache::Cache(std::string &bucket) {
+    std::string name(bucket);
+    name += ".db";
+    char **result;
+    int rows;
+    int columns;
+    char *err;
+    int status;
+
+    pthread_mutex_init(&lock, NULL);
+    auto_lock sync(lock);
+
+    if (sqlite3_open(name.c_str(), &conn) != SQLITE_OK) {
+        std::cerr << "Can't open database: " << name << ": " <<
+            sqlite3_errmsg(conn) << std::endl;
+        exit(-1);
+    }
+
+    // create the table if it does not already exist
+    status = sqlite3_get_table(conn,
+        "CREATE TABLE cache (\n"
+        "    path VARCHAR(256) NOT NULL,\n"
+        "    uid INTEGER,\n"
+        "    gid INTEGER,\n"
+        "    mode INTEGER,\n"
+        "    mtime INTEGER,\n"
+        "    size INTEGER,\n"
+        "    PRIMARY KEY (path)\n"
+        ")",
+        &result, &rows, &columns, &err);
+
+    if (status == SQLITE_OK)
+        sqlite3_free_table(result);
+    else
+        sqlite3_free(err);
+}
+
+Cache::~Cache() {
+    {
+        auto_lock sync(lock);
+        sqlite3_close(conn);
+    }
+    pthread_mutex_destroy(&lock);
+}
+
+int Cache::get(std::string &path, struct stat *info) {
+    char **result;
+    int rows;
+    int columns;
+    char *err;
+    int status = 0;
+    char *query;
+
+    auto_lock sync(lock);
+
+    query = sqlite3_mprintf(
+        "SELECT uid, gid, mode, mtime, size FROM cache WHERE path = '%q'",
+        path.c_str());
+    std::cout << "query: " << query << std::endl;
+    if (sqlite3_get_table(conn, query, &result, &rows, &columns, &err) ==
+            SQLITE_OK)
+    {
+        if (rows > 0) {
+            // get the data from the second row
+            info->st_nlink = 1;
+            info->st_uid = strtoul(result[5], NULL, 10);
+            info->st_gid = strtoul(result[6], NULL, 10);
+            info->st_mode = strtoul(result[7], NULL, 10);
+            info->st_mtime = strtoul(result[8], NULL, 10);
+            info->st_size = strtoul(result[9], NULL, 10);
+            if (S_ISREG(info->st_mode))
+                info->st_blocks = info->st_size / 512 + 1;
+            status = 1;
+        }
+        sqlite3_free_table(result);
+    } else {
+        std::cerr << "get_entry error: " << err << std::endl;
+        sqlite3_free(err);
+    }
+    sqlite3_free(query);
+
+    return status;
+}
+
+int Cache::get(const char *path, struct stat *info) {
+    std::string name(path);
+    return get(name, info);
+}
+
+void Cache::set(std::string &path, struct stat *info) {
+    char **result;
+    int rows;
+    int columns;
+    char *err;
+    char *query;
+
+    // make sure there isn't an existing entry
+    del(path);
+
+    auto_lock sync(lock);
+
+    query = sqlite3_mprintf(
+        "INSERT INTO cache (path, uid, gid, mode, mtime, size)\n"
+        "VALUES ('%q', '%u', '%u', '%u', '%u', '%u')",
+        path.c_str(),
+        info->st_uid,
+        info->st_gid,
+        info->st_mode,
+        info->st_mtime,
+        info->st_size);
+    if (sqlite3_get_table(conn, query, &result, &rows, &columns, &err) ==
+            SQLITE_OK)
+    {
+        sqlite3_free_table(result);
+    } else {
+        std::cerr << "set_entry error: " << err << std::endl;
+        sqlite3_free(err);
+    }
+    sqlite3_free(query);
+}
+
+void Cache::set(const char *path, struct stat *info) {
+    std::string name(path);
+    set(name, info);
+}
+
+void Cache::del(std::string &path) {
+    char **result;
+    int rows;
+    int columns;
+    char *err;
+    char *query;
+
+    auto_lock sync(lock);
+
+    query = sqlite3_mprintf(
+        "DELETE FROM cache WHERE path = '%q'",
+        path.c_str());
+    if (sqlite3_get_table(conn, query, &result, &rows, &columns, &err) ==
+            SQLITE_OK)
+    {
+        sqlite3_free_table(result);
+    } else {
+        std::cerr << "delete_entry error: " << err << std::endl;
+        sqlite3_free(err);
+    }
+    sqlite3_free(query);
+}
+
+void Cache::del(const char *path) {
+    std::string name(path);
+    del(name);
+}
+
 static Cache *db;
 
 static const char hexAlphabet[] = "0123456789ABCDEF";
@@ -777,12 +945,8 @@ s3fs_getattr(const char *path, struct stat *stbuf) {
         return 0;
     }
 
-    {
-        auto_lock lock(stat_cache_lock);
-        string path_s(path);
-        if (db->get(path_s, stbuf))
-            return 0;
-    }
+    if (db->get(path, stbuf))
+        return 0;
 
     string resource = urlEncode("/"+bucket + path);
     string url = host + resource;
@@ -830,10 +994,9 @@ s3fs_getattr(const char *path, struct stat *stbuf) {
         stbuf->st_blocks = stbuf->st_size / 512 + 1;
 
     stbuf->st_uid = strtoul(responseHeaders["x-amz-meta-uid"].c_str(), (char **)NULL, 10);
-  stbuf->st_gid = strtoul(responseHeaders["x-amz-meta-gid"].c_str(), (char **)NULL, 10);
+    stbuf->st_gid = strtoul(responseHeaders["x-amz-meta-gid"].c_str(), (char **)NULL, 10);
 
-    string path_s(path);
-    db->set(path_s, stbuf);
+    db->set(path, stbuf);
 
     return 0;
 }
@@ -897,6 +1060,8 @@ s3fs_mknod(const char *path, mode_t mode, dev_t rdev) {
     // If pathname already exists, or is a symbolic link, this call fails with an EEXIST error.
     cout << "mknod[path="<< path << "][mode=" << mode << "]" << endl;
 
+    db->del(path);
+
     string resource = urlEncode("/"+bucket + path);
     string url = host + resource;
 
@@ -929,6 +1094,8 @@ s3fs_mknod(const char *path, mode_t mode, dev_t rdev) {
 static int
 s3fs_mkdir(const char *path, mode_t mode) {
     cout << "mkdir[path=" << path << "][mode=" << mode << "]" << endl;
+
+    db->del(path);
 
     string resource = urlEncode("/"+bucket + path);
     string url = host + resource;
@@ -963,6 +1130,8 @@ static int
 s3fs_unlink(const char *path) {
     cout << "unlink[path=" << path << "]" << endl;
 
+    db->del(path);
+
     string resource = urlEncode("/"+bucket + path);
     string url = host + resource;
 
@@ -986,6 +1155,8 @@ s3fs_unlink(const char *path) {
 static int
 s3fs_rmdir(const char *path) {
     cout << "unlink[path=" << path << "]" << endl;
+
+    db->del(path);
 
     string resource = urlEncode("/"+bucket + path);
     string url = host + resource;
@@ -1011,6 +1182,8 @@ static int
 s3fs_symlink(const char *from, const char *to) {
     cout << "symlink[from=" << from << "][to=" << to << "]" << endl;
 
+    db->del(from);
+
     headers_t headers;
     headers["x-amz-meta-mode"] = str(S_IFLNK);
     headers["x-amz-meta-mtime"] = str(time(NULL));
@@ -1028,6 +1201,9 @@ s3fs_symlink(const char *from, const char *to) {
 static int
 s3fs_rename(const char *from, const char *to) {
     cout << "rename[from=" << from << "][to=" << to << "]" << endl;
+
+    db->del(from);
+    db->del(to);
 
     // preserve meta headers across rename
     headers_t meta;
@@ -1048,12 +1224,18 @@ s3fs_rename(const char *from, const char *to) {
 static int
 s3fs_link(const char *from, const char *to) {
     cout << "link[from=" << from << "][to=" << to << "]" << endl;
+
+    db->del(to);
+
     return -EPERM;
 }
 
 static int
 s3fs_chmod(const char *path, mode_t mode) {
     cout << "chmod[path=" << path << "][mode=" << mode << "]" << endl;
+
+    db->del(path);
+
     headers_t meta;
     VERIFY(get_headers(path, meta));
     meta["x-amz-meta-mode"] = str(mode);
@@ -1067,22 +1249,24 @@ s3fs_chmod(const char *path, mode_t mode) {
 
 static int
 s3fs_chown(const char *path, uid_t uid, gid_t gid) {
-  cout << "chown[path=" << path << "]" << endl;
+    cout << "chown[path=" << path << "]" << endl;
 
-  headers_t meta;
-  VERIFY(get_headers(path, meta));
+    db->del(path);
 
-  struct passwd* aaa = getpwuid(uid);
-  if (aaa != 0)
-    meta["x-amz-meta-uid"] = str((*aaa).pw_uid);
+    headers_t meta;
+    VERIFY(get_headers(path, meta));
 
-  struct group* bbb = getgrgid(gid);
-  if (bbb != 0)
-    meta["x-amz-meta-gid"] = str((*bbb).gr_gid);
+    struct passwd* aaa = getpwuid(uid);
+    if (aaa != 0)
+        meta["x-amz-meta-uid"] = str((*aaa).pw_uid);
 
-  meta["x-amz-copy-source"] = urlEncode("/" + bucket + path);
-  meta["x-amz-metadata-directive"] = "REPLACE";
-  return put_headers(path, meta);
+    struct group* bbb = getgrgid(gid);
+    if (bbb != 0)
+        meta["x-amz-meta-gid"] = str((*bbb).gr_gid);
+
+    meta["x-amz-copy-source"] = urlEncode("/" + bucket + path);
+    meta["x-amz-metadata-directive"] = "REPLACE";
+    return put_headers(path, meta);
 }
 
 static int
@@ -1090,6 +1274,8 @@ s3fs_truncate(const char *path, off_t size) {
     //###TODO honor size?!?
 
     cout << "truncate[path=" << path << "][size=" << size << "]" << endl;
+
+    db->del(path);
 
     // preserve headers across truncate
     headers_t meta;
@@ -1134,6 +1320,8 @@ s3fs_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_fi
 static int
 s3fs_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
     //###cout << "write: " << path << endl;
+    db->del(path);
+
     int res = pwrite(fi->fh, buf, size, offset);
     if (res == -1)
         Yikes(-errno);
@@ -1361,7 +1549,6 @@ static void* s3fs_init(struct fuse_conn_info *conn) {
   curl_global_init(CURL_GLOBAL_ALL);
   pthread_mutex_init(&curl_handles_lock, NULL);
   pthread_mutex_init(&s3fs_descriptors_lock, NULL);
-  pthread_mutex_init(&stat_cache_lock, NULL);
   //
   string line;
   ifstream passwd("/etc/mime.types");
@@ -1394,7 +1581,6 @@ static void s3fs_destroy(void*) {
   curl_global_cleanup();
   pthread_mutex_destroy(&curl_handles_lock);
   pthread_mutex_destroy(&s3fs_descriptors_lock);
-  pthread_mutex_destroy(&stat_cache_lock);
 }
 
 static int

@@ -1,5 +1,5 @@
 all:
-	g++ -ggdb -Wall $(shell pkg-config fuse --cflags --libs) $(shell pkg-config libcurl --cflags --libs) $(shell xml2-config --cflags --libs) -lcrypto -lsqlite3 s3fs.cpp sqlitecache.cpp -o s3fs
+	g++ -ggdb -Wall $(shell pkg-config fuse --cflags --libs) $(shell pkg-config libcurl --cflags --libs) $(shell xml2-config --cflags --libs) -lcrypto -lsqlite3 s3fs.cpp -o s3fs
 	@echo ok!
 
 install: all
