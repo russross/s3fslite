@@ -107,9 +107,22 @@ missing:
 
 *   libcurl4-openssl-dev
 
+*   libfuse2
+
 *   libfuse-dev
 
+*   fuse-utils
+
 *   libsqlite3-dev
+
+*   pkg-config
+
+To install them all, use this command from a shell:
+
+    sudo apt-get install build-essential libxml2-dev libcurl4-openssl-dev libfuse2 libfuse-dev fuse-utils libsqlite3-dev pkg-config
+
+If you do this and it does not compile from Ubuntu, please let me
+know so I can update the list with any missing packages.
 
 
 Downloading and compiling:
