@@ -126,6 +126,12 @@ typedef pair<double, double> progress_t;
 static map<CURL*, time_t> curl_times;
 static map<CURL*, progress_t> curl_progress;
 
+// http headers
+typedef map<string, string> headers_t;
+
+int get_headers(const char *path, headers_t &meta);
+
+
 // homegrown timeout mechanism
 static int my_curl_progress(void *clientp, double dltotal,
         double dlnow, double ultotal, double ulnow)
@@ -293,7 +299,7 @@ static string bucket;
 static string AWSAccessKeyId;
 static string AWSSecretAccessKey;
 static string host = "http://s3.amazonaws.com";
-static mode_t root_mode = 0;
+static mode_t root_mode = 0755;
 
 // if .size()==0 then local file cache is disabled
 static string use_cache;
@@ -302,25 +308,140 @@ static string use_cache;
 static string default_acl("private");
 
 //
-// SQLite attribute caching
+// File info
 //
-class Attrcache {
-private:
-    sqlite3 *conn;
-    pthread_mutex_t lock;
 
-public:
-    Attrcache(std::string &bucket);
-    int get(std::string &path, struct stat *info);
-    int get(const char *path, struct stat *info);
-    void set(std::string &path, struct stat *info);
-    void set(const char *path, struct stat *info);
-    void del(std::string &path);
-    void del(const char *path);
-    ~Attrcache();
+class Fileinfo {
+    public:
+        string path;
+        unsigned uid;
+        unsigned gid;
+        mode_t mode;
+        time_t mtime;
+        size_t size;
+        string etag;
+
+        Fileinfo(const char *path, struct stat *info, const char *etag);
+        Fileinfo(const char *path, unsigned uid, unsigned gid,
+                mode_t mode, time_t mtime, size_t size, const char *etag);
+        void set(const char *path, unsigned uid, unsigned gid,
+                mode_t mode, time_t mtime, size_t size, const char *etag);
+
+        void toStat(struct stat *info);
 };
 
-Attrcache::Attrcache(std::string &bucket) {
+class Attrcache {
+    private:
+        sqlite3 *conn;
+        pthread_mutex_t lock;
+
+    public:
+        Attrcache(const char *bucket);
+        Fileinfo get(const char *path);
+        void set(const char *path, struct stat *info, const char *etag);
+        void set(Fileinfo &info);
+        void del(const char *path);
+        ~Attrcache();
+};
+
+static Attrcache *attrcache;
+
+Fileinfo::Fileinfo(const char *path, unsigned uid, unsigned gid,
+        mode_t mode, time_t mtime, size_t size, const char *etag)
+{
+    set(path, uid, gid, mode, mtime, size, etag);
+}
+
+Fileinfo::Fileinfo(const char *path, struct stat *info, const char *etag) {
+    set(path, info->st_uid, info->st_gid, info->st_mode, info->st_mtime,
+            info->st_size, etag);
+}
+
+void Fileinfo::set(const char *path, unsigned uid, unsigned gid,
+    mode_t mode, time_t mtime, size_t size, const char *etag)
+{
+    this->path = path;
+    this->uid = uid;
+    this->gid = gid;
+    this->mode = mode;
+    this->mtime = mtime;
+    this->size = size;
+    this->etag = etag;
+}
+
+void Fileinfo::toStat(struct stat *info) {
+    bzero(info, sizeof(struct stat));
+    info->st_nlink = 1;
+    info->st_uid = uid;
+    info->st_gid = gid;
+    info->st_mode = mode;
+    info->st_mtime = mtime;
+    info->st_size = size;
+    if (S_ISREG(mode))
+        info->st_blocks = info->st_size / 512 + 1;
+}
+
+Fileinfo get_fileinfo(const char *path) {
+    // first check the cache
+    try {
+        Fileinfo result = attrcache->get(path);
+        return result;
+    } catch (int e) {
+        // cache miss
+    }
+
+    // special case for /
+    if (!strcmp(path, "/")) {
+        Fileinfo result(path, 0, 0, root_mode | S_IFDIR, time(NULL), 0, "");
+
+        // we'll even store it in the cache so rsync can update it
+        attrcache->set(result);
+        return result;
+    }
+
+    // do a header lookup
+    headers_t meta;
+
+    int status = get_headers(path, meta);
+    if (status)
+        throw status;
+
+    // fill in info based on header results
+    unsigned mtime = strtoul(meta["x-amz-meta-mtime"].c_str(), NULL, 10);
+    if (mtime == 0) {
+        // no mtime header? Parse the Last-Modified header instead
+        // Last-Modified: Fri, 25 Sep 2009 22:24:38 GMT
+        struct tm tm;
+        strptime(meta["Last-Modified"].c_str(), "%a, %d %b %Y %T", &tm);
+        mtime = mktime(&tm);
+    }
+
+    mode_t mode = strtoul(meta["x-amz-meta-mode"].c_str(), NULL, 10);
+    if (!(mode & S_IFMT)) {
+        // missing file type: try to at least figure out if it is a directory
+        if (meta["Content-Type"] == "application/x-directory")
+            mode |= S_IFDIR;
+        else
+            mode |= S_IFREG;
+    }
+
+    size_t size = strtoull(meta["Content-Length"].c_str(), NULL, 10);
+    unsigned uid = strtoul(meta["x-amz-meta-uid"].c_str(), NULL, 10);
+    unsigned gid = strtoul(meta["x-amz-meta-gid"].c_str(), NULL, 10);
+
+    string etag(trim(meta["ETag"], "\""));
+    Fileinfo result(path, uid, gid, mode, mtime, size, etag.c_str());
+
+    // update the cache
+    attrcache->set(result);
+
+    return result;
+}
+
+//
+// SQLite attribute caching
+//
+Attrcache::Attrcache(const char *bucket) {
     std::string name(bucket);
     name += ".db";
     char **result;
@@ -347,6 +468,7 @@ Attrcache::Attrcache(std::string &bucket) {
         "    mode INTEGER,\n"
         "    mtime INTEGER,\n"
         "    size INTEGER,\n"
+        "    etag VARCHAR(96),\n"
         "    PRIMARY KEY (path)\n"
         ")",
         &result, &rows, &columns, &err);
@@ -365,51 +487,52 @@ Attrcache::~Attrcache() {
     pthread_mutex_destroy(&lock);
 }
 
-int Attrcache::get(std::string &path, struct stat *info) {
-    char **result;
+Fileinfo Attrcache::get(const char *path) {
+    char **data;
     int rows;
     int columns;
     char *err;
-    int status = 0;
     char *query;
 
     auto_lock sync(lock);
 
+    // perform the query
     query = sqlite3_mprintf(
-        "SELECT uid, gid, mode, mtime, size FROM cache WHERE path = '%q'",
-        path.c_str());
-    std::cout << "query: " << query << std::endl;
-    if (sqlite3_get_table(conn, query, &result, &rows, &columns, &err) ==
-            SQLITE_OK)
-    {
-        if (rows > 0) {
-            // get the data from the second row
-            info->st_nlink = 1;
-            info->st_uid = strtoul(result[5], NULL, 10);
-            info->st_gid = strtoul(result[6], NULL, 10);
-            info->st_mode = strtoul(result[7], NULL, 10);
-            info->st_mtime = strtoul(result[8], NULL, 10);
-            info->st_size = strtoul(result[9], NULL, 10);
-            if (S_ISREG(info->st_mode))
-                info->st_blocks = info->st_size / 512 + 1;
-            status = 1;
-        }
-        sqlite3_free_table(result);
-    } else {
-        std::cerr << "get_entry error: " << err << std::endl;
-        sqlite3_free(err);
-    }
+        "SELECT uid, gid, mode, mtime, size, etag FROM cache WHERE path = '%q'",
+        path);
+    int status = sqlite3_get_table(conn, query, &data, &rows, &columns, &err);
     sqlite3_free(query);
 
-    return status;
+    // error?
+    if (status != SQLITE_OK) {
+        string msg("Attrcache:get sqlite error: ");
+        msg += err;
+        syslog(LOG_ERR, msg.c_str());
+        sqlite3_free(err);
+        throw -1;
+    }
+
+    // no results?
+    if (rows == 0) {
+        sqlite3_free_table(data);
+        throw -1;
+    }
+
+    // get the data from the second row
+    Fileinfo result(
+            path,
+            strtoul(data[6], NULL, 10), // uid
+            strtoul(data[7], NULL, 10), // gid
+            strtoul(data[8], NULL, 10), // mode
+            strtoul(data[9], NULL, 10), // mtime
+            strtoul(data[10], NULL, 10), // size
+            data[11]); // etag
+    sqlite3_free_table(data);
+
+    return result;
 }
 
-int Attrcache::get(const char *path, struct stat *info) {
-    std::string name(path);
-    return get(name, info);
-}
-
-void Attrcache::set(std::string &path, struct stat *info) {
+void Attrcache::set(const char *path, struct stat *info, const char *etag) {
     char **result;
     int rows;
     int columns;
@@ -422,14 +545,15 @@ void Attrcache::set(std::string &path, struct stat *info) {
     auto_lock sync(lock);
 
     query = sqlite3_mprintf(
-        "INSERT INTO cache (path, uid, gid, mode, mtime, size)\n"
-        "VALUES ('%q', '%u', '%u', '%u', '%u', '%u')",
-        path.c_str(),
+        "INSERT INTO cache (path, uid, gid, mode, mtime, size, etag)\n"
+        "VALUES ('%q', '%u', '%u', '%u', '%u', '%u', '%q')",
+        path,
         info->st_uid,
         info->st_gid,
         info->st_mode,
         info->st_mtime,
-        info->st_size);
+        info->st_size,
+        etag);
     if (sqlite3_get_table(conn, query, &result, &rows, &columns, &err) ==
             SQLITE_OK)
     {
@@ -441,12 +565,13 @@ void Attrcache::set(std::string &path, struct stat *info) {
     sqlite3_free(query);
 }
 
-void Attrcache::set(const char *path, struct stat *info) {
-    std::string name(path);
-    set(name, info);
+void Attrcache::set(Fileinfo &info) {
+    struct stat attr;
+    info.toStat(&attr);
+    set(info.path.c_str(), &attr, info.etag.c_str());
 }
 
-void Attrcache::del(std::string &path) {
+void Attrcache::del(const char *path) {
     char **result;
     int rows;
     int columns;
@@ -457,7 +582,7 @@ void Attrcache::del(std::string &path) {
 
     query = sqlite3_mprintf(
         "DELETE FROM cache WHERE path = '%q'",
-        path.c_str());
+        path);
     if (sqlite3_get_table(conn, query, &result, &rows, &columns, &err) ==
             SQLITE_OK)
     {
@@ -469,12 +594,21 @@ void Attrcache::del(std::string &path) {
     sqlite3_free(query);
 }
 
-void Attrcache::del(const char *path) {
-    std::string name(path);
-    del(name);
-}
 
-static Attrcache *attrcache;
+//
+// File cache
+//
+
+typedef vector <unsigned char> bytes;
+
+#define MAX_CACHE_ENTRIES 20
+#define MAX_CACHE_FILE_SIZE 1024*1024*16
+
+class Filecache {
+    private:
+        // path -> fileinfo
+
+};
 
 static const char hexAlphabet[] = "0123456789ABCDEF";
 
@@ -502,9 +636,6 @@ string urlEncode(const string &s) {
     }
     return result;
 }
-
-// http headers
-typedef map<string, string> headers_t;
 
 #include <openssl/bio.h>
 #include <openssl/buffer.h>
@@ -678,12 +809,13 @@ int get_headers(const char *path, headers_t &meta) {
     {
         string key = (*iter).first;
         string value = (*iter).second;
-        if (key == "Content-Type")
-            meta[key] = value;
-        if (key == "ETag")
-            meta[key] = value;
-        if (key.substr(0, 5) == "x-amz")
-            meta[key] = value;
+        meta[key] = value;
+//        if (key == "Content-Type")
+//            meta[key] = value;
+//        if (key == "ETag")
+//            meta[key] = value;
+//        if (key.substr(0, 5) == "x-amz")
+//            meta[key] = value;
     }
 
     return 0;
@@ -933,78 +1065,20 @@ static int put_local_fd(const char *path, headers_t meta, int fd) {
 }
 
 static int s3fs_getattr(const char *path, struct stat *stbuf) {
+    string msg("getattr [");
+    msg += path;
+    msg += "]";
+    syslog(LOG_INFO, msg.c_str());
+
     cout << "getattr[path=" << path << "]" << endl;
-    memset(stbuf, 0, sizeof(struct stat));
-    if (strcmp(path, "/") == 0) {
-        stbuf->st_nlink = 1; // see fuse faq
-        stbuf->st_mode = root_mode | S_IFDIR;
+    try {
+        Fileinfo info = get_fileinfo(path);
+        info.toStat(stbuf);
         return 0;
+    } catch (int e) {
+        syslog(LOG_INFO, "getattr error");
+        return e;
     }
-
-    if (attrcache->get(path, stbuf))
-        return 0;
-
-    string resource = urlEncode("/" + bucket + path);
-    string url = host + resource;
-
-    auto_curl curl;
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_FAILONERROR, true);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, true);
-    curl_easy_setopt(curl, CURLOPT_NOBODY, true); // HEAD
-    curl_easy_setopt(curl, CURLOPT_FILETIME, true); // Last-Modified
-
-    headers_t responseHeaders;
-    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &responseHeaders);
-    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_callback);
-
-    auto_curl_slist headers;
-    string date = get_date();
-    headers.append("Date: " + date);
-    headers.append("Authorization: AWS " + AWSAccessKeyId + ":" +
-            calc_signature("HEAD", "", date, headers.get(), resource));
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers.get());
-
-    VERIFY(my_curl_easy_perform(curl.get()));
-
-    stbuf->st_nlink = 1; // see fuse faq
-
-    stbuf->st_mtime = strtoul(responseHeaders["x-amz-meta-mtime"].c_str(),
-            (char **) NULL, 10);
-    if (stbuf->st_mtime == 0) {
-        long LastModified;
-        if (curl_easy_getinfo(curl, CURLINFO_FILETIME, &LastModified) == 0)
-            stbuf->st_mtime = LastModified;
-    }
-
-    stbuf->st_mode = strtoul(responseHeaders["x-amz-meta-mode"].c_str(),
-            (char **) NULL, 10);
-    char* ContentType = 0;
-    if (curl_easy_getinfo(curl, CURLINFO_CONTENT_TYPE, &ContentType) == 0) {
-        if (ContentType)
-            stbuf->st_mode |=
-                strcmp(ContentType, "application/x-directory") == 0 ?
-                    S_IFDIR : S_IFREG;
-    }
-
-    double ContentLength;
-    if (curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD,
-                &ContentLength) == 0)
-    {
-        stbuf->st_size = static_cast<off_t>(ContentLength);
-    }
-
-    if (S_ISREG(stbuf->st_mode))
-        stbuf->st_blocks = stbuf->st_size / 512 + 1;
-
-    stbuf->st_uid = strtoul(responseHeaders["x-amz-meta-uid"].c_str(),
-            (char **) NULL, 10);
-    stbuf->st_gid = strtoul(responseHeaders["x-amz-meta-gid"].c_str(),
-            (char **) NULL, 10);
-
-    attrcache->set(path, stbuf);
-
-    return 0;
 }
 
 static int s3fs_readlink(const char *path, char *buf, size_t size) {
@@ -1063,6 +1137,12 @@ static int s3fs_mknod(const char *path, mode_t mode, dev_t rdev) {
     // this call fails with an EEXIST error.
     cout << "mknod[path="<< path << "][mode=" << mode << "]" << endl;
 
+    string msg("mknod [");
+    msg += path;
+    msg += "] mode=";
+    msg += str(mode);
+    syslog(LOG_INFO, msg.c_str());
+
     attrcache->del(path);
 
     string resource = urlEncode("/"+bucket + path);
@@ -1083,7 +1163,7 @@ static int s3fs_mknod(const char *path, mode_t mode, dev_t rdev) {
     // x-amz headers: (a) alphabetical order and (b) no spaces after colon
     headers.append("x-amz-acl:" + default_acl);
     headers.append("x-amz-meta-gid:" + str(getgid()));
-    headers.append("x-amz-meta-mode:" + str(mode));
+    headers.append("x-amz-meta-mode:" + str(mode | S_ISREG));
     headers.append("x-amz-meta-mtime:" + str(time(NULL)));
     headers.append("x-amz-meta-uid:" + str(getuid()));
     headers.append("Authorization: AWS " + AWSAccessKeyId + ":" +
@@ -1117,7 +1197,7 @@ static int s3fs_mkdir(const char *path, mode_t mode) {
     // x-amz headers: (a) alphabetical order and (b) no spaces after colon
     headers.append("x-amz-acl:" + default_acl);
     headers.append("x-amz-meta-gid:" + str(getgid()));
-    headers.append("x-amz-meta-mode:" + str(mode));
+    headers.append("x-amz-meta-mode:" + str(mode | S_IFDIR));
     headers.append("x-amz-meta-mtime:" + str(time(NULL)));
     headers.append("x-amz-meta-uid:" + str(getuid()));
     headers.append("Authorization: AWS " + AWSAccessKeyId + ":" +
@@ -1205,23 +1285,32 @@ static int s3fs_symlink(const char *from, const char *to) {
 static int s3fs_rename(const char *from, const char *to) {
     cout << "rename[from=" << from << "][to=" << to << "]" << endl;
 
-    attrcache->del(from);
-    attrcache->del(to);
+    try {
+        Fileinfo info = get_fileinfo(from);
+        headers_t meta;
+        meta["x-amz-copy-source"] = urlEncode("/" + bucket + from);
+        meta["x-amz-meta-uid"] = str(info.uid);
+        meta["x-amz-meta-gid"] = str(info.gid);
+        meta["x-amz-meta-mode"] = str(info.mode);
+        meta["x-amz-meta-mtime"] = str(info.mtime);
+        meta["Content-Length"] = str(info.size);
+        meta["Content-Type"] = lookupMimeType(to);
+        meta["x-amz-metadata-directive"] = "REPLACE";
 
-    // preserve meta headers across rename
-    headers_t meta;
-    VERIFY(get_headers(from, meta));
+        attrcache->del(to);
 
-    meta["x-amz-copy-source"] = urlEncode("/" + bucket + from);
-    meta["Content-Type"] = lookupMimeType(to);
-    meta["x-amz-metadata-directive"] = "REPLACE";
+        int result = put_headers(to, meta);
+        if (result != 0)
+            return result;
 
-    int result = put_headers(to, meta);
-    if (result != 0)
-        return result;
+        // put the new name in the cache
+        info.path = to;
+        attrcache->set(info);
 
-    return s3fs_unlink(from);
-
+        return s3fs_unlink(from);
+    } catch (int e) {
+        return e;
+    }
 }
 
 static int s3fs_link(const char *from, const char *to) {
@@ -1684,9 +1773,11 @@ int main(int argc, char *argv[]) {
     s3fs_oper.access = s3fs_access;
     s3fs_oper.utimens = s3fs_utimens;
 
-    attrcache = new Attrcache(bucket);
+    attrcache = new Attrcache(bucket.c_str());
 
-    return fuse_main(custom_args.argc, custom_args.argv, &s3fs_oper, NULL);
+    int status =
+        fuse_main(custom_args.argc, custom_args.argv, &s3fs_oper, NULL);
 
     delete attrcache;
+    return status;
 }
