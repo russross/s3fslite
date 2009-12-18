@@ -357,6 +357,7 @@ mode_t root_mode = 0755;
 
 // if .size()==0 then local file cache is disabled
 string use_cache;
+string attr_cache;
 
 // private, public-read, public-read-write, authenticated-read
 string default_acl("private");
@@ -532,8 +533,11 @@ Fileinfo get_fileinfo(const char *path) {
 // SQLite attribute caching
 //
 Attrcache::Attrcache(const char *bucket) {
-    std::string name(bucket);
-    name += ".db";
+    std::string name(attr_cache);
+    if (name.size() > 0 && name[name.size() - 1] != '/')
+        name += "/";
+    name += bucket;
+    name += ".sqlite";
     char **result;
     int rows;
     int columns;
@@ -632,7 +636,6 @@ void Attrcache::set(const char *path, struct stat *info, const char *etag) {
 
     auto_lock sync(lock);
 
-    syslog(LOG_INFO, "Attrcache::set etag[%s]", etag);
     query = sqlite3_mprintf(
         "INSERT INTO cache (path, uid, gid, mode, mtime, size, etag)\n"
         "VALUES ('%q', '%u', '%u', '%u', '%u', '%llu', '%q')",
@@ -1759,6 +1762,10 @@ int my_fuse_opt_proc(void *data, const char *arg,
         }
         if (strstr(arg, "url=") != 0) {
             host = strchr(arg, '=') + 1;
+            return 0;
+        }
+        if (strstr(arg, "attr_cache=") != 0) {
+            attr_cache = strchr(arg, '=') + 1;
             return 0;
         }
     }
