@@ -56,8 +56,8 @@ long connect_timeout = 2;
 time_t readwrite_timeout = 10;
 
 #define MAX_KEYS_PER_DIR_REQUEST "200"
-
 #define DEFAULT_MIME_TYPE "application/octet-stream"
+#define MD5_EMPTY "d41d8cd98f00b204e9800998ecf8427e"
 
 #define VERIFY(s) do { \
     int result = (s); \
@@ -186,7 +186,6 @@ string lookupMimeType(string s) {
         result = (*iter).second;
     return result;
 }
-
 
 // homegrown timeout mechanism
 int my_curl_progress(void *clientp, double dltotal,
@@ -360,7 +359,17 @@ string use_cache;
 string attr_cache;
 
 // private, public-read, public-read-write, authenticated-read
-string default_acl("private");
+string default_acl;
+string private_acl("private");
+string public_acl("public-read");
+
+string getAcl(mode_t mode) {
+    if (default_acl != "")
+        return default_acl;
+    if (mode & S_IROTH)
+        return public_acl;
+    return private_acl;
+}
 
 //
 // File info
@@ -482,7 +491,8 @@ Fileinfo get_fileinfo(const char *path) {
 
     // special case for /
     if (!strcmp(path, "/")) {
-        Fileinfo result(path, 0, 0, root_mode | S_IFDIR, time(NULL), 0, "");
+        Fileinfo result(path, 0, 0, root_mode | S_IFDIR, time(NULL), 0,
+                MD5_EMPTY);
 
         // we'll even store it in the cache so rsync can update it
         attrcache->set(result);
@@ -844,6 +854,10 @@ int mkdirp(const string &path, mode_t mode) {
  * TODO return pair<int, headers_t>?!?
  */
 int get_headers(const char *path, headers_t &head) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "get_headers[%s]", path);
+#endif
+
     string resource(urlEncode("/" + bucket + path));
     string url(host + resource);
 
@@ -1013,6 +1027,10 @@ int get_local_fd(const char *path) {
  * @return fuse return code
  */
 int put_headers(const char *path, headers_t head) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "put_headers[%s]", path);
+#endif
+
     string resource = urlEncode("/" + bucket + path);
     string url = host + resource;
 
@@ -1034,7 +1052,8 @@ int put_headers(const char *path, headers_t head) {
     string date = get_date();
     headers.append("Date: " + date);
 
-    head["x-amz-acl"] = default_acl;
+    head["x-amz-acl"] =
+        getAcl(strtoul(head["x-amz-meta-mode"].c_str(), NULL, 10));
 
     for (headers_t::iterator iter = head.begin(); iter != head.end(); ++iter) {
         string key = (*iter).first;
@@ -1102,7 +1121,8 @@ int put_local_fd(const char *path, headers_t head, int fd) {
     string date = get_date();
     headers.append("Date: " + date);
 
-    head["x-amz-acl"] = default_acl;
+    head["x-amz-acl"] =
+        getAcl(strtoul(head["x-amz-meta-mode"].c_str(), NULL, 10));
 
     for (headers_t::iterator iter = head.begin(); iter != head.end(); ++iter) {
         string key = (*iter).first;
@@ -1204,18 +1224,22 @@ int generic_create(const char *path, mode_t mode) {
     else if (mode & S_IFREG)
         contentType = lookupMimeType(path);
 
+    Fileinfo info(path, getuid(), getgid(), mode, time(NULL), 0, MD5_EMPTY);
+
     headers.append("Content-Type: " + contentType);
     // x-amz headers: (a) alphabetical order and (b) no spaces after colon
-    headers.append("x-amz-acl:" + default_acl);
-    headers.append("x-amz-meta-gid:" + str(getgid()));
-    headers.append("x-amz-meta-mode:" + str(mode));
-    headers.append("x-amz-meta-mtime:" + str(time(NULL)));
-    headers.append("x-amz-meta-uid:" + str(getuid()));
+    headers.append("x-amz-acl:" + getAcl(info.mode));
+    headers.append("x-amz-meta-gid:" + str(info.gid));
+    headers.append("x-amz-meta-mode:" + str(info.mode));
+    headers.append("x-amz-meta-mtime:" + str(info.mtime));
+    headers.append("x-amz-meta-uid:" + str(info.uid));
     headers.append("Authorization: AWS " + AWSAccessKeyId + ":" +
             calc_signature("PUT", contentType, date, headers.get(), resource));
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers.get());
 
     VERIFY(my_curl_easy_perform(curl.get()));
+
+    attrcache->set(info);
 
     return 0;
 }
