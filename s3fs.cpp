@@ -59,6 +59,8 @@ time_t readwrite_timeout = 10;
 
 #define MAX_KEYS_PER_DIR_REQUEST "200"
 
+#define DEFAULT_MIME_TYPE "application/octet-stream"
+
 #define VERIFY(s) do { \
     int result = (s); \
     if (result != 0) \
@@ -176,7 +178,7 @@ mimes_t mimeTypes;
  * @return e.g., "text/html"
  */
 string lookupMimeType(string s) {
-    string result("application/octet-stream");
+    string result(DEFAULT_MIME_TYPE);
     string::size_type pos = s.find_last_of('.');
     if (pos != string::npos) {
         s = s.substr(1 + pos, string::npos);
@@ -448,6 +450,8 @@ void Fileinfo::updateHeaders(const char *target) {
         head["Content-Type"] = "application/x-directory";
     else if (mode & S_IFREG)
         head["Content-Type"] = lookupMimeType(path);
+    else
+        head["Content-Type"] = DEFAULT_MIME_TYPE;
     head["x-amz-metadata-directive"] = "REPLACE";
 
     attrcache->del(path.c_str());
@@ -1188,10 +1192,10 @@ int generic_create(const char *path, mode_t mode) {
     string date = get_date();
     headers.append("Date: " + date);
 
-    string contentType;
+    string contentType(DEFAULT_MIME_TYPE);
     if (mode & S_IFDIR)
         contentType = "application/x-directory";
-    else
+    else if (mode & S_IFREG)
         contentType = lookupMimeType(path);
 
     headers.append("Content-Type: " + contentType);
