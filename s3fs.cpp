@@ -31,6 +31,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <dirent.h>
+#include <pwd.h>
+#include <grp.h>
 #include <errno.h>
 #include <sys/time.h>
 #include <libgen.h>
@@ -52,10 +54,10 @@
 
 using namespace std;
 
-static long connect_timeout = 2;
-static time_t readwrite_timeout = 10;
+long connect_timeout = 2;
+time_t readwrite_timeout = 10;
 
-#define MAX_KEYS_PER_DIR_REQUEST "100"
+#define MAX_KEYS_PER_DIR_REQUEST "200"
 
 #define VERIFY(s) do { \
     int result = (s); \
@@ -64,7 +66,7 @@ static time_t readwrite_timeout = 10;
 } while (0)
 
 #define Yikes(result) do { \
-    syslog(LOG_ERR,"%d###result=%d", __LINE__, result); \
+    syslog(LOG_ERR, "yikes[%s] line[%u]", strerror(result), __LINE__); \
     return result; \
 } while (0)
 
@@ -119,29 +121,81 @@ public:
     }
 };
 
-static stack<CURL*> curl_handles;
-static pthread_mutex_t curl_handles_lock;
+stack<CURL*> curl_handles;
+pthread_mutex_t curl_handles_lock;
 
 typedef pair<double, double> progress_t;
-static map<CURL*, time_t> curl_times;
-static map<CURL*, progress_t> curl_progress;
+map<CURL*, time_t> curl_times;
+map<CURL*, progress_t> curl_progress;
 
 // http headers
 typedef map<string, string> headers_t;
 
-int get_headers(const char *path, headers_t &meta);
+int get_headers(const char *path, headers_t &head);
+int put_headers(const char *path, headers_t head);
+
+const char hexAlphabet[] = "0123456789ABCDEF";
+
+/**
+ * urlEncode a fuse path,
+ * taking into special consideration "/",
+ * otherwise regular urlEncode.
+ */
+string urlEncode(const string &s) {
+    string result;
+    for (unsigned i = 0; i < s.length(); ++i) {
+        if (s[i] == '/') // Note- special case for fuse paths...
+            result += s[i];
+        else if (isalnum(s[i]))
+            result += s[i];
+        else if (s[i] == '.' || s[i] == '-' || s[i] == '*' || s[i] == '_')
+            result += s[i];
+        else if (s[i] == ' ')
+            result += '+';
+        else {
+            result += "%";
+            result += hexAlphabet[static_cast<unsigned char>(s[i]) / 16];
+            result += hexAlphabet[static_cast<unsigned char>(s[i]) % 16];
+        }
+    }
+    return result;
+}
+
+struct case_insensitive_compare_func {
+    bool operator ()(const string &a, const string &b) {
+        return strcasecmp(a.c_str(), b.c_str()) < 0;
+    }
+};
+
+typedef map<string, string, case_insensitive_compare_func> mimes_t;
+
+mimes_t mimeTypes;
+
+/**
+ * @param s e.g., "index.html"
+ * @return e.g., "text/html"
+ */
+string lookupMimeType(string s) {
+    string result("application/octet-stream");
+    string::size_type pos = s.find_last_of('.');
+    if (pos != string::npos) {
+        s = s.substr(1 + pos, string::npos);
+    }
+    mimes_t::const_iterator iter = mimeTypes.find(s);
+    if (iter != mimeTypes.end())
+        result = (*iter).second;
+    return result;
+}
 
 
 // homegrown timeout mechanism
-static int my_curl_progress(void *clientp, double dltotal,
+int my_curl_progress(void *clientp, double dltotal,
         double dlnow, double ultotal, double ulnow)
 {
     CURL *curl = static_cast<CURL *>(clientp);
 
     time_t now = time(0);
     progress_t p(dlnow, ulnow);
-
-    //###cout << "/dlnow=" << dlnow << "/ulnow=" << ulnow << endl;
 
     auto_lock lock(curl_handles_lock);
 
@@ -159,7 +213,7 @@ static int my_curl_progress(void *clientp, double dltotal,
     return 0;
 }
 
-static CURL *alloc_curl_handle() {
+CURL *alloc_curl_handle() {
     CURL *curl;
     auto_lock lock(curl_handles_lock);
     if (curl_handles.size() == 0)
@@ -187,7 +241,7 @@ static CURL *alloc_curl_handle() {
     return curl;
 }
 
-static void return_curl_handle(CURL *curl_handle) {
+void return_curl_handle(CURL *curl_handle) {
     if (curl_handle != 0) {
         auto_lock lock(curl_handles_lock);
         curl_handles.push(curl_handle);
@@ -259,12 +313,12 @@ public:
 };
 
 // -oretries=2
-static int retries = 2;
+int retries = 2;
 
 /**
  * @return fuse return code
  */
-static int my_curl_easy_perform(CURL *curl, FILE *f = 0) {
+int my_curl_easy_perform(CURL *curl, FILE *f = 0) {
     // 1 attempt + retries...
     int t = 1 + retries;
     while (t-- > 0) {
@@ -295,17 +349,17 @@ static int my_curl_easy_perform(CURL *curl, FILE *f = 0) {
     return -EIO;
 }
 
-static string bucket;
-static string AWSAccessKeyId;
-static string AWSSecretAccessKey;
-static string host = "http://s3.amazonaws.com";
-static mode_t root_mode = 0755;
+string bucket;
+string AWSAccessKeyId;
+string AWSSecretAccessKey;
+string host = "http://s3.amazonaws.com";
+mode_t root_mode = 0755;
 
 // if .size()==0 then local file cache is disabled
-static string use_cache;
+string use_cache;
 
 // private, public-read, public-read-write, authenticated-read
-static string default_acl("private");
+string default_acl("private");
 
 //
 // File info
@@ -326,6 +380,7 @@ class Fileinfo {
                 mode_t mode, time_t mtime, size_t size, const char *etag);
         void set(const char *path, unsigned uid, unsigned gid,
                 mode_t mode, time_t mtime, size_t size, const char *etag);
+        void updateHeaders(const char *target = 0);
 
         void toStat(struct stat *info);
 };
@@ -344,7 +399,7 @@ class Attrcache {
         ~Attrcache();
 };
 
-static Attrcache *attrcache;
+Attrcache *attrcache;
 
 Fileinfo::Fileinfo(const char *path, unsigned uid, unsigned gid,
         mode_t mode, time_t mtime, size_t size, const char *etag)
@@ -381,6 +436,32 @@ void Fileinfo::toStat(struct stat *info) {
         info->st_blocks = info->st_size / 512 + 1;
 }
 
+void Fileinfo::updateHeaders(const char *target) {
+    headers_t head;
+    head["x-amz-copy-source"] = urlEncode("/" + bucket + path);
+    head["x-amz-meta-uid"] = str(uid);
+    head["x-amz-meta-gid"] = str(gid);
+    head["x-amz-meta-mode"] = str(mode);
+    head["x-amz-meta-mtime"] = str(mtime);
+    head["Content-Length"] = str(size);
+    if (mode & S_IFDIR)
+        head["Content-Type"] = "application/x-directory";
+    else if (mode & S_IFREG)
+        head["Content-Type"] = lookupMimeType(path);
+    head["x-amz-metadata-directive"] = "REPLACE";
+
+    attrcache->del(path.c_str());
+
+    int result = put_headers(target ? target : path.c_str(), head);
+    if (result != 0)
+        throw result;
+
+    // put the new name in the cache
+    if (target)
+        path = target;
+    attrcache->set(*this);
+}
+
 Fileinfo get_fileinfo(const char *path) {
     // first check the cache
     try {
@@ -400,36 +481,37 @@ Fileinfo get_fileinfo(const char *path) {
     }
 
     // do a header lookup
-    headers_t meta;
+    headers_t head;
 
-    int status = get_headers(path, meta);
+    int status = get_headers(path, head);
     if (status)
         throw status;
 
     // fill in info based on header results
-    unsigned mtime = strtoul(meta["x-amz-meta-mtime"].c_str(), NULL, 10);
+    unsigned mtime = strtoul(head["x-amz-meta-mtime"].c_str(), NULL, 10);
     if (mtime == 0) {
         // no mtime header? Parse the Last-Modified header instead
         // Last-Modified: Fri, 25 Sep 2009 22:24:38 GMT
         struct tm tm;
-        strptime(meta["Last-Modified"].c_str(), "%a, %d %b %Y %T", &tm);
+        strptime(head["Last-Modified"].c_str(),
+                "%a, %d %b %Y %H:%M:%S GMT", &tm);
         mtime = mktime(&tm);
     }
 
-    mode_t mode = strtoul(meta["x-amz-meta-mode"].c_str(), NULL, 10);
+    mode_t mode = strtoul(head["x-amz-meta-mode"].c_str(), NULL, 10);
     if (!(mode & S_IFMT)) {
         // missing file type: try to at least figure out if it is a directory
-        if (meta["Content-Type"] == "application/x-directory")
+        if (head["Content-Type"] == "application/x-directory")
             mode |= S_IFDIR;
         else
             mode |= S_IFREG;
     }
 
-    size_t size = strtoull(meta["Content-Length"].c_str(), NULL, 10);
-    unsigned uid = strtoul(meta["x-amz-meta-uid"].c_str(), NULL, 10);
-    unsigned gid = strtoul(meta["x-amz-meta-gid"].c_str(), NULL, 10);
+    size_t size = strtoull(head["Content-Length"].c_str(), NULL, 10);
+    unsigned uid = strtoul(head["x-amz-meta-uid"].c_str(), NULL, 10);
+    unsigned gid = strtoul(head["x-amz-meta-gid"].c_str(), NULL, 10);
 
-    string etag(trim(meta["ETag"], "\""));
+    string etag(trim(head["ETag"], "\""));
     Fileinfo result(path, uid, gid, mode, mtime, size, etag.c_str());
 
     // update the cache
@@ -544,9 +626,10 @@ void Attrcache::set(const char *path, struct stat *info, const char *etag) {
 
     auto_lock sync(lock);
 
+    syslog(LOG_INFO, "Attrcache::set etag[%s]", etag);
     query = sqlite3_mprintf(
         "INSERT INTO cache (path, uid, gid, mode, mtime, size, etag)\n"
-        "VALUES ('%q', '%u', '%u', '%u', '%u', '%u', '%q')",
+        "VALUES ('%q', '%u', '%u', '%u', '%u', '%llu', '%q')",
         path,
         info->st_uid,
         info->st_gid,
@@ -610,39 +693,12 @@ class Filecache {
 
 };
 
-static const char hexAlphabet[] = "0123456789ABCDEF";
-
-/**
- * urlEncode a fuse path,
- * taking into special consideration "/",
- * otherwise regular urlEncode.
- */
-string urlEncode(const string &s) {
-    string result;
-    for (unsigned i = 0; i < s.length(); ++i) {
-        if (s[i] == '/') // Note- special case for fuse paths...
-            result += s[i];
-        else if (isalnum(s[i]))
-            result += s[i];
-        else if (s[i] == '.' || s[i] == '-' || s[i] == '*' || s[i] == '_')
-            result += s[i];
-        else if (s[i] == ' ')
-            result += '+';
-        else {
-            result += "%";
-            result += hexAlphabet[static_cast<unsigned char>(s[i]) / 16];
-            result += hexAlphabet[static_cast<unsigned char>(s[i]) % 16];
-        }
-    }
-    return result;
-}
-
 #include <openssl/bio.h>
 #include <openssl/buffer.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 
-static const EVP_MD *evp_md = EVP_sha1();
+const EVP_MD *evp_md = EVP_sha1();
 
 /**
  * Returns the current date
@@ -675,7 +731,6 @@ string calc_signature(string method, string content_type, string date,
     int count = 0;
     if (headers != 0) {
         do {
-            //###cout << headers->data << endl;
             if (strncmp(headers->data, "x-amz", 5) == 0) {
                 ++count;
                 StringToSign += headers->data;
@@ -712,7 +767,7 @@ string calc_signature(string method, string content_type, string date,
 }
 
 // libcurl callback
-static size_t readCallback(void *data, size_t blockSize, size_t numBlocks,
+size_t readCallback(void *data, size_t blockSize, size_t numBlocks,
         void *userPtr)
 {
     string *userString = static_cast<string *>(userPtr);
@@ -723,7 +778,7 @@ static size_t readCallback(void *data, size_t blockSize, size_t numBlocks,
 }
 
 // libcurl callback
-static size_t writeCallback(void* data, size_t blockSize, size_t numBlocks,
+size_t writeCallback(void* data, size_t blockSize, size_t numBlocks,
         void *userPtr)
 {
     string *userString = static_cast<string *>(userPtr);
@@ -732,7 +787,7 @@ static size_t writeCallback(void* data, size_t blockSize, size_t numBlocks,
     return blockSize * numBlocks;
 }
 
-static size_t header_callback(void *data, size_t blockSize, size_t numBlocks,
+size_t header_callback(void *data, size_t blockSize, size_t numBlocks,
         void *userPtr)
 {
     headers_t *headers = reinterpret_cast<headers_t *>(userPtr);
@@ -748,19 +803,19 @@ static size_t header_callback(void *data, size_t blockSize, size_t numBlocks,
 }
 
 // safe variant of dirname
-static string mydirname(string path) {
+string mydirname(string path) {
     // dirname clobbers path so let it operate on a tmp copy
     return dirname(&path[0]);
 }
 
 // safe variant of basename
-static string mybasename(string path) {
+string mybasename(string path) {
     // basename clobbers path so let it operate on a tmp copy
     return basename(&path[0]);
 }
 
 // mkdir --parents
-static int mkdirp(const string &path, mode_t mode) {
+int mkdirp(const string &path, mode_t mode) {
     string base;
     string component;
     stringstream ss(path);
@@ -778,7 +833,7 @@ static int mkdirp(const string &path, mode_t mode) {
  * @return fuse return code
  * TODO return pair<int, headers_t>?!?
  */
-int get_headers(const char *path, headers_t &meta) {
+int get_headers(const char *path, headers_t &head) {
     string resource(urlEncode("/" + bucket + path));
     string url(host + resource);
 
@@ -809,13 +864,13 @@ int get_headers(const char *path, headers_t &meta) {
     {
         string key = (*iter).first;
         string value = (*iter).second;
-        meta[key] = value;
+        head[key] = value;
 //        if (key == "Content-Type")
-//            meta[key] = value;
+//            head[key] = value;
 //        if (key == "ETag")
-//            meta[key] = value;
+//            head[key] = value;
 //        if (key.substr(0, 5) == "x-amz")
-//            meta[key] = value;
+//            head[key] = value;
     }
 
     return 0;
@@ -925,7 +980,9 @@ int get_local_fd(const char *path) {
                 calc_signature("GET", "", date, headers.get(), resource));
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers.get());
 
-        cout << "downloading[path=" << path << "][fd=" << fd << "]" << endl;
+#ifdef DEBUG
+        syslog(LOG_INFO, "downloading[%s]", path);
+#endif
 
         VERIFY(my_curl_easy_perform(curl.get(), f));
 
@@ -945,7 +1002,7 @@ int get_local_fd(const char *path) {
  * create or update s3 meta
  * @return fuse return code
  */
-static int put_headers(const char *path, headers_t meta) {
+int put_headers(const char *path, headers_t head) {
     string resource = urlEncode("/" + bucket + path);
     string url = host + resource;
 
@@ -961,15 +1018,15 @@ static int put_headers(const char *path, headers_t meta) {
     curl_easy_setopt(curl, CURLOPT_UPLOAD, true); // HTTP PUT
     curl_easy_setopt(curl, CURLOPT_INFILESIZE, 0); // Content-Length
 
-    string ContentType = meta["Content-Type"];
+    string ContentType = head["Content-Type"];
 
     auto_curl_slist headers;
     string date = get_date();
     headers.append("Date: " + date);
 
-    meta["x-amz-acl"] = default_acl;
+    head["x-amz-acl"] = default_acl;
 
-    for (headers_t::iterator iter = meta.begin(); iter != meta.end(); ++iter) {
+    for (headers_t::iterator iter = head.begin(); iter != head.end(); ++iter) {
         string key = (*iter).first;
         string value = (*iter).second;
         if (key == "Content-Type")
@@ -988,8 +1045,10 @@ static int put_headers(const char *path, headers_t meta) {
 
     //###rewind(f);
 
-    syslog(LOG_INFO, "copy path=%s", path);
-    cout << "copying[path=" << path << "]" << endl;
+#ifdef DEBUG
+    syslog(LOG_INFO, "copying[%s] -> [%s]",
+            head["x-amz-copy-source"].c_str(), path);
+#endif
 
     VERIFY(my_curl_easy_perform(curl.get()));
 
@@ -1000,7 +1059,7 @@ static int put_headers(const char *path, headers_t meta) {
  * create or update s3 object
  * @return fuse return code
  */
-static int put_local_fd(const char *path, headers_t meta, int fd) {
+int put_local_fd(const char *path, headers_t head, int fd) {
     string resource = urlEncode("/" + bucket + path);
     string url = host + resource;
 
@@ -1027,15 +1086,15 @@ static int put_local_fd(const char *path, headers_t meta, int fd) {
         Yikes(-errno);
     curl_easy_setopt(curl, CURLOPT_INFILE, f);
 
-    string ContentType = meta["Content-Type"];
+    string ContentType = head["Content-Type"];
 
     auto_curl_slist headers;
     string date = get_date();
     headers.append("Date: " + date);
 
-    meta["x-amz-acl"] = default_acl;
+    head["x-amz-acl"] = default_acl;
 
-    for (headers_t::iterator iter = meta.begin(); iter != meta.end(); ++iter) {
+    for (headers_t::iterator iter = head.begin(); iter != head.end(); ++iter) {
         string key = (*iter).first;
         string value = (*iter).second;
         if (key == "Content-Type")
@@ -1052,9 +1111,9 @@ static int put_local_fd(const char *path, headers_t meta, int fd) {
 
     //###rewind(f);
 
-    syslog(LOG_INFO, "upload path=%s size=%llu", path, st.st_size);
-    cout << "uploading[path=" << path << "][fd=" << fd <<
-        "][size=" << st.st_size << "]" << endl;
+#ifdef DEBUG
+    syslog(LOG_INFO, "uploading[%s] size[%llu]", path, st.st_size);
+#endif
 
     VERIFY(my_curl_easy_perform(curl.get(), f));
 
@@ -1064,28 +1123,34 @@ static int put_local_fd(const char *path, headers_t meta, int fd) {
     return 0;
 }
 
-static int s3fs_getattr(const char *path, struct stat *stbuf) {
-    string msg("getattr [");
-    msg += path;
-    msg += "]";
-    syslog(LOG_INFO, msg.c_str());
+int s3fs_getattr(const char *path, struct stat *stbuf) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "getattr[%s]", path);
+#endif
 
-    cout << "getattr[path=" << path << "]" << endl;
     try {
         Fileinfo info = get_fileinfo(path);
         info.toStat(stbuf);
         return 0;
     } catch (int e) {
-        syslog(LOG_INFO, "getattr error");
+        if (e == -ENOENT) {
+#ifdef DEBUG
+            syslog(LOG_INFO, "getattr[%s]: %s", path, strerror(e));
+#endif
+        } else {
+            syslog(LOG_INFO, "getattr[%s]: %s", path, strerror(e));
+        }
         return e;
     }
 }
 
-static int s3fs_readlink(const char *path, char *buf, size_t size) {
-    if (size > 0) {
-        --size; // reserve nil terminator
+int s3fs_readlink(const char *path, char *buf, size_t size) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "readlink[%s]", path);
+#endif
 
-        cout << "readlink[path=" << path << "]" << endl;
+    if (size > 0) {
+        size--; // reserve nil terminator
 
         auto_fd fd(get_local_fd(path));
 
@@ -1105,47 +1170,11 @@ static int s3fs_readlink(const char *path, char *buf, size_t size) {
     return 0;
 }
 
-struct case_insensitive_compare_func {
-    bool operator ()(const string &a, const string &b) {
-        return strcasecmp(a.c_str(), b.c_str()) < 0;
-    }
-};
-
-typedef map<string, string, case_insensitive_compare_func> mimes_t;
-
-static mimes_t mimeTypes;
-
-/**
- * @param s e.g., "index.html"
- * @return e.g., "text/html"
- */
-string lookupMimeType(string s) {
-    string result("application/octet-stream");
-    string::size_type pos = s.find_last_of('.');
-    if (pos != string::npos) {
-        s = s.substr(1 + pos, string::npos);
-    }
-    mimes_t::const_iterator iter = mimeTypes.find(s);
-    if (iter != mimeTypes.end())
-        result = (*iter).second;
-    return result;
-}
-
-static int s3fs_mknod(const char *path, mode_t mode, dev_t rdev) {
-    // see man 2 mknod
-    // If pathname already exists, or is a symbolic link,
-    // this call fails with an EEXIST error.
-    cout << "mknod[path="<< path << "][mode=" << mode << "]" << endl;
-
-    string msg("mknod [");
-    msg += path;
-    msg += "] mode=";
-    msg += str(mode);
-    syslog(LOG_INFO, msg.c_str());
-
+// create a new file/directory
+int generic_create(const char *path, mode_t mode) {
     attrcache->del(path);
 
-    string resource = urlEncode("/"+bucket + path);
+    string resource = urlEncode("/" + bucket + path);
     string url = host + resource;
 
     auto_curl curl;
@@ -1158,12 +1187,18 @@ static int s3fs_mknod(const char *path, mode_t mode, dev_t rdev) {
     auto_curl_slist headers;
     string date = get_date();
     headers.append("Date: " + date);
-    string contentType(lookupMimeType(path));
+
+    string contentType;
+    if (mode & S_IFDIR)
+        contentType = "application/x-directory";
+    else
+        contentType = lookupMimeType(path);
+
     headers.append("Content-Type: " + contentType);
     // x-amz headers: (a) alphabetical order and (b) no spaces after colon
     headers.append("x-amz-acl:" + default_acl);
     headers.append("x-amz-meta-gid:" + str(getgid()));
-    headers.append("x-amz-meta-mode:" + str(mode | S_ISREG));
+    headers.append("x-amz-meta-mode:" + str(mode));
     headers.append("x-amz-meta-mtime:" + str(time(NULL)));
     headers.append("x-amz-meta-uid:" + str(getuid()));
     headers.append("Authorization: AWS " + AWSAccessKeyId + ":" +
@@ -1175,45 +1210,27 @@ static int s3fs_mknod(const char *path, mode_t mode, dev_t rdev) {
     return 0;
 }
 
-static int s3fs_mkdir(const char *path, mode_t mode) {
-    cout << "mkdir[path=" << path << "][mode=" << mode << "]" << endl;
+int s3fs_mknod(const char *path, mode_t mode, dev_t rdev) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "mknod[%s] mode[0%o]", path, mode);
+#endif
 
-    attrcache->del(path);
+    // see man 2 mknod
+    // If pathname already exists, or is a symbolic link,
+    // this call fails with an EEXIST error.
 
-    string resource = urlEncode("/" + bucket + path);
-    string url = host + resource;
-
-    auto_curl curl;
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_FAILONERROR, true);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, true);
-    curl_easy_setopt(curl, CURLOPT_UPLOAD, true); // HTTP PUT
-    curl_easy_setopt(curl, CURLOPT_INFILESIZE, 0); // Content-Length: 0
-
-    auto_curl_slist headers;
-    string date = get_date();
-    headers.append("Date: " + date);
-    headers.append("Content-Type: application/x-directory");
-    // x-amz headers: (a) alphabetical order and (b) no spaces after colon
-    headers.append("x-amz-acl:" + default_acl);
-    headers.append("x-amz-meta-gid:" + str(getgid()));
-    headers.append("x-amz-meta-mode:" + str(mode | S_IFDIR));
-    headers.append("x-amz-meta-mtime:" + str(time(NULL)));
-    headers.append("x-amz-meta-uid:" + str(getuid()));
-    headers.append("Authorization: AWS " + AWSAccessKeyId + ":" +
-            calc_signature("PUT", "application/x-directory", date,
-                headers.get(), resource));
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers.get());
-
-    VERIFY(my_curl_easy_perform(curl.get()));
-
-    return 0;
+    return generic_create(path, mode | S_IFREG);
 }
 
-// aka rm
-static int s3fs_unlink(const char *path) {
-    cout << "unlink[path=" << path << "]" << endl;
+int s3fs_mkdir(const char *path, mode_t mode) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "mkdir[%s] mode[0%o]", path, mode);
+#endif
 
+    return generic_create(path, mode | S_IFDIR);
+}
+
+int generic_remove(const char *path) {
     attrcache->del(path);
 
     string resource = urlEncode("/" + bucket + path);
@@ -1237,34 +1254,26 @@ static int s3fs_unlink(const char *path) {
     return 0;
 }
 
-static int s3fs_rmdir(const char *path) {
-    cout << "unlink[path=" << path << "]" << endl;
+int s3fs_unlink(const char *path) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "unlink[%s]", path);
+#endif
 
-    attrcache->del(path);
-
-    string resource = urlEncode("/" + bucket + path);
-    string url = host + resource;
-
-    auto_curl curl;
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_FAILONERROR, true);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, true);
-    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
-
-    auto_curl_slist headers;
-    string date = get_date();
-    headers.append("Date: " + date);
-    headers.append("Authorization: AWS " + AWSAccessKeyId + ":" +
-            calc_signature("DELETE", "", date, headers.get(), resource));
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers.get());
-
-    VERIFY(my_curl_easy_perform(curl.get()));
-
-    return 0;
+    return generic_remove(path);
 }
 
-static int s3fs_symlink(const char *from, const char *to) {
-    cout << "symlink[from=" << from << "][to=" << to << "]" << endl;
+int s3fs_rmdir(const char *path) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "rmdir[%s]", path);
+#endif
+
+    return generic_remove(path);
+}
+
+int s3fs_symlink(const char *from, const char *to) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "symlink[%s] -> [%s]", from, to);
+#endif
 
     attrcache->del(from);
 
@@ -1282,30 +1291,19 @@ static int s3fs_symlink(const char *from, const char *to) {
     return 0;
 }
 
-static int s3fs_rename(const char *from, const char *to) {
-    cout << "rename[from=" << from << "][to=" << to << "]" << endl;
+int s3fs_rename(const char *from, const char *to) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "rename[%s] -> [%s]", from, to);
+#endif
 
     try {
         Fileinfo info = get_fileinfo(from);
-        headers_t meta;
-        meta["x-amz-copy-source"] = urlEncode("/" + bucket + from);
-        meta["x-amz-meta-uid"] = str(info.uid);
-        meta["x-amz-meta-gid"] = str(info.gid);
-        meta["x-amz-meta-mode"] = str(info.mode);
-        meta["x-amz-meta-mtime"] = str(info.mtime);
-        meta["Content-Length"] = str(info.size);
-        meta["Content-Type"] = lookupMimeType(to);
-        meta["x-amz-metadata-directive"] = "REPLACE";
 
-        attrcache->del(to);
+        // no renaming directories (yet)
+        if (info.mode & S_IFDIR)
+            return -ENOTSUP;
 
-        int result = put_headers(to, meta);
-        if (result != 0)
-            return result;
-
-        // put the new name in the cache
-        info.path = to;
-        attrcache->set(info);
+        info.updateHeaders(to);
 
         return s3fs_unlink(from);
     } catch (int e) {
@@ -1313,77 +1311,99 @@ static int s3fs_rename(const char *from, const char *to) {
     }
 }
 
-static int s3fs_link(const char *from, const char *to) {
-    cout << "link[from=" << from << "][to=" << to << "]" << endl;
+int s3fs_link(const char *from, const char *to) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "link[%s] -> [%s]", from, to);
+#endif
 
-    attrcache->del(to);
+    try {
+        Fileinfo info = get_fileinfo(from);
 
-    return -EPERM;
+        // no linking directories
+        if (info.mode & S_IFDIR)
+            return -ENOTSUP;
+
+        info.updateHeaders(to);
+
+        return 0;
+    } catch (int e) {
+        return e;
+    }
 }
 
-static int s3fs_chmod(const char *path, mode_t mode) {
-    cout << "chmod[path=" << path << "][mode=" << mode << "]" << endl;
+int s3fs_chmod(const char *path, mode_t mode) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "chmod[%s] mode[0%o]", path, mode);
+#endif
 
-    attrcache->del(path);
+    try {
+        Fileinfo info = get_fileinfo(path);
 
-    headers_t meta;
-    VERIFY(get_headers(path, meta));
-    meta["x-amz-meta-mode"] = str(mode);
-    meta["x-amz-copy-source"] = urlEncode("/" + bucket + path);
-    meta["x-amz-metadata-directive"] = "REPLACE";
-    return put_headers(path, meta);
+        // make sure we have a file type
+        if (!(mode & S_IFMT))
+            mode |= (info.mode & S_IFMT);
+
+        info.mode = mode;
+
+        info.updateHeaders();
+
+        return 0;
+    } catch (int e) {
+        return e;
+    }
 }
 
-#include <pwd.h>
-#include <grp.h>
+int s3fs_chown(const char *path, uid_t uid, gid_t gid) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "chown[%s] uid[%d] gid[%d]", path, uid, gid);
+#endif
 
-static int s3fs_chown(const char *path, uid_t uid, gid_t gid) {
-    cout << "chown[path=" << path << "]" << endl;
+    try {
+        Fileinfo info = get_fileinfo(path);
 
-    attrcache->del(path);
+        // uid or gid < 0 indicates no change
+        if (uid >= 0)
+            info.uid = uid;
+        if (gid >= 0)
+            info.gid = gid;
 
-    headers_t meta;
-    VERIFY(get_headers(path, meta));
+        info.updateHeaders();
 
-    struct passwd* aaa = getpwuid(uid);
-    if (aaa != 0)
-        meta["x-amz-meta-uid"] = str((*aaa).pw_uid);
-
-    struct group* bbb = getgrgid(gid);
-    if (bbb != 0)
-        meta["x-amz-meta-gid"] = str((*bbb).gr_gid);
-
-    meta["x-amz-copy-source"] = urlEncode("/" + bucket + path);
-    meta["x-amz-metadata-directive"] = "REPLACE";
-    return put_headers(path, meta);
+        return 0;
+    } catch (int e) {
+        return e;
+    }
 }
 
-static int s3fs_truncate(const char *path, off_t size) {
+int s3fs_truncate(const char *path, off_t size) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "truncate[%s] size[%llu]", path, size);
+#endif
+
     //###TODO honor size?!?
-
-    cout << "truncate[path=" << path << "][size=" << size << "]" << endl;
 
     attrcache->del(path);
 
     // preserve headers across truncate
-    headers_t meta;
-    VERIFY(get_headers(path, meta));
+    headers_t head;
+    VERIFY(get_headers(path, head));
     auto_fd fd(fileno(tmpfile()));
     //###verify fd here?!?
-    VERIFY(put_local_fd(path, meta, fd.get()));
+    VERIFY(put_local_fd(path, head, fd.get()));
 
     return 0;
 }
 
 // fd -> flags
 typedef map<int, int> s3fs_descriptors_t;
-static s3fs_descriptors_t s3fs_descriptors;
-static pthread_mutex_t s3fs_descriptors_lock;
+s3fs_descriptors_t s3fs_descriptors;
+pthread_mutex_t s3fs_descriptors_lock;
 
-static int s3fs_open(const char *path, struct fuse_file_info *fi) {
-    cout << "open[path=" << path << "][flags=" << fi->flags << "]" <<  endl;
+int s3fs_open(const char *path, struct fuse_file_info *fi) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "open[%s] flags[0%o]", path, fi->flags);
+#endif
 
-    headers_t meta;
     //###TODO check fi->fh here...
     fi->fh = get_local_fd(path);
 
@@ -1395,20 +1415,26 @@ static int s3fs_open(const char *path, struct fuse_file_info *fi) {
     return 0;
 }
 
-static int s3fs_read(const char *path, char *buf,
+int s3fs_read(const char *path, char *buf,
         size_t size, off_t offset, struct fuse_file_info *fi)
 {
-    //###cout << "read: " << path << endl;
+#ifdef DEBUG
+    syslog(LOG_INFO, "read[%s] size[%u] offset[%llu]", path, size, offset);
+#endif
+
     int res = pread(fi->fh, buf, size, offset);
     if (res == -1)
         Yikes(-errno);
     return res;
 }
 
-static int s3fs_write(const char *path, const char *buf,
+int s3fs_write(const char *path, const char *buf,
         size_t size, off_t offset, struct fuse_file_info *fi)
 {
-    //###cout << "write: " << path << endl;
+#ifdef DEBUG
+    syslog(LOG_INFO, "write[%s] size[%u] offset[%llu]", path, size, offset);
+#endif
+
     attrcache->del(path);
 
     int res = pwrite(fi->fh, buf, size, offset);
@@ -1417,7 +1443,11 @@ static int s3fs_write(const char *path, const char *buf,
     return res;
 }
 
-static int s3fs_statfs(const char *path, struct statvfs *stbuf) {
+int s3fs_statfs(const char *path, struct statvfs *stbuf) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "statfs[%s]", path);
+#endif
+
     // 256T
     stbuf->f_bsize = 0X1000000;
     stbuf->f_blocks = 0X1000000;
@@ -1426,28 +1456,34 @@ static int s3fs_statfs(const char *path, struct statvfs *stbuf) {
     return 0;
 }
 
-static int get_flags(int fd) {
+int get_flags(int fd) {
     auto_lock lock(s3fs_descriptors_lock);
     return s3fs_descriptors[fd];
 }
 
-static int s3fs_flush(const char *path, struct fuse_file_info *fi) {
+int s3fs_flush(const char *path, struct fuse_file_info *fi) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "flush[%s]", path);
+#endif
+
     int fd = fi->fh;
-    cout << "flush[path=" << path << "][fd=" << fd << "]" << endl;
     // NOTE- fi->flags is not available here
     int flags = get_flags(fd);
     if ((flags & O_RDWR) || (flags &  O_WRONLY)) {
-        headers_t meta;
-        VERIFY(get_headers(path, meta));
-        meta["x-amz-meta-mtime"]=str(time(NULL));
-        return put_local_fd(path, meta, fd);
+        headers_t head;
+        VERIFY(get_headers(path, head));
+        head["x-amz-meta-mtime"]=str(time(NULL));
+        return put_local_fd(path, head, fd);
     }
     return 0;
 }
 
-static int s3fs_release(const char *path, struct fuse_file_info *fi) {
+int s3fs_release(const char *path, struct fuse_file_info *fi) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "release[%s]", path);
+#endif
+
     int fd = fi->fh;
-    cout << "release[path=" << path << "][fd=" << fd << "]" << endl;
     if (close(fd) == -1)
         Yikes(-errno);
     return 0;
@@ -1469,10 +1505,15 @@ time_t my_timegm(struct tm *tm) {
     return ret;
 }
 
-static int s3fs_readdir(const char *path, void *buf,
+int s3fs_readdir(const char *path, void *buf,
         fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi)
 {
-    //cout << "readdir:"<< " path="<< path << endl;
+#ifdef DEBUG
+    syslog(LOG_INFO, "readdir[%s] offset[%llu]", path, offset);
+#endif
+
+    filler(buf, ".", 0, 0);
+    filler(buf, "..", 0, 0);
 
     string NextMarker;
     string IsTruncated("true");
@@ -1561,7 +1602,7 @@ static int s3fs_readdir(const char *path, void *buf,
     return 0;
 }
 
-static pthread_mutex_t *mutex_buf = NULL;
+pthread_mutex_t *mutex_buf = NULL;
 
 /**
  * OpenSSL locking function.
@@ -1572,7 +1613,7 @@ static pthread_mutex_t *mutex_buf = NULL;
  * @param    line    source file line number
  * @return    none
  */
-static void locking_function(int mode, int n, const char *file, int line) {
+void locking_function(int mode, int n, const char *file, int line) {
     if (mode & CRYPTO_LOCK) {
         pthread_mutex_lock(&mutex_buf[n]);
     } else {
@@ -1585,12 +1626,13 @@ static void locking_function(int mode, int n, const char *file, int line) {
  *
  * @return    thread id
  */
-static unsigned long id_function(void) {
+unsigned long id_function(void) {
     return ((unsigned long) pthread_self());
 }
 
-static void *s3fs_init(struct fuse_conn_info *conn) {
-    syslog(LOG_INFO, "init $Rev$");
+void *s3fs_init(struct fuse_conn_info *conn) {
+    syslog(LOG_INFO, "init[%s]", bucket.c_str());
+
     // openssl
     mutex_buf = static_cast<pthread_mutex_t *>(
             malloc(CRYPTO_num_locks() * sizeof(pthread_mutex_t)));
@@ -1621,8 +1663,9 @@ static void *s3fs_init(struct fuse_conn_info *conn) {
     return 0;
 }
 
-static void s3fs_destroy(void*) {
-    syslog(LOG_INFO, "destroy");
+void s3fs_destroy(void*) {
+    syslog(LOG_INFO, "destroy[%s]", bucket.c_str());
+
     // openssl
     CRYPTO_set_id_callback(NULL);
     CRYPTO_set_locking_callback(NULL);
@@ -1635,24 +1678,34 @@ static void s3fs_destroy(void*) {
     pthread_mutex_destroy(&s3fs_descriptors_lock);
 }
 
-static int s3fs_access(const char *path, int mask) {
-    //###cout << "###access[path=" << path << "]" <<  endl;
+int s3fs_access(const char *path, int mask) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "access[%s] mask[0%o]", path, mask);
+#endif
+
     return 0;
 }
 
 // aka touch
-static int s3fs_utimens(const char *path, const struct timespec ts[2]) {
-    cout << "utimens[path=" << path << "][mtime=" <<
-        str(ts[1].tv_sec) << "]" << endl;
-    headers_t meta;
-    VERIFY(get_headers(path, meta));
-    meta["x-amz-meta-mtime"] = str(ts[1].tv_sec);
-    meta["x-amz-copy-source"] = urlEncode("/" + bucket + path);
-    meta["x-amz-metadata-directive"] = "REPLACE";
-    return put_headers(path, meta);
+int s3fs_utimens(const char *path, const struct timespec ts[2]) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "utimens[%s] mtime[%ld]", path, ts[1].tv_sec);
+#endif
+
+    try {
+        Fileinfo info = get_fileinfo(path);
+
+        info.mtime = ts[1].tv_sec;
+
+        info.updateHeaders();
+
+        return 0;
+    } catch (int e) {
+        return e;
+    }
 }
 
-static int my_fuse_opt_proc(void *data, const char *arg,
+int my_fuse_opt_proc(void *data, const char *arg,
         int key, struct fuse_args *outargs)
 {
     if (key == FUSE_OPT_KEY_NONOPT) {
@@ -1705,7 +1758,7 @@ static int my_fuse_opt_proc(void *data, const char *arg,
     return 1;
 }
 
-static struct fuse_operations s3fs_oper;
+struct fuse_operations s3fs_oper;
 
 int main(int argc, char *argv[]) {
     memset(&s3fs_oper, sizeof(s3fs_oper), 0);
