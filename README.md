@@ -52,6 +52,10 @@ This fork has the following changes:
     browsers. Setting the "default_acl" option overrides this, and
     sets everything to the specified ACL.
 
+*   MD5 sums are computed for all uploads. S3 verifies the checksum
+    on the received data, ensuring that no data was corrupted in
+    transit (at least not during uploads).
+
 
 Quick start
 ===========

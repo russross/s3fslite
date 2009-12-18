@@ -374,6 +374,9 @@ int my_curl_easy_perform(CURL *curl, FILE *f = 0) {
             if (responseCode == 404)
                 return -ENOENT;
 
+            if (responseCode == 403)
+                return -EACCES;
+
             syslog(LOG_ERR, "curl unexpected error code [%ld]", responseCode);
 
             if (responseCode < 500)
@@ -761,13 +764,13 @@ string get_date() {
  * @param date e.g., get_date()
  * @param resource e.g., "/pub"
  */
-string calc_signature(string method, string content_type, string date,
-        curl_slist* headers, string resource)
+string calc_signature(string method, string content_md5, string content_type,
+        string date, curl_slist* headers, string resource)
 {
     string Signature;
     string StringToSign;
     StringToSign += method + "\n";
-    StringToSign += "\n"; // md5
+    StringToSign += content_md5 + "\n";
     StringToSign += content_type + "\n";
     StringToSign += date + "\n";
     int count = 0;
@@ -796,6 +799,7 @@ string calc_signature(string method, string content_type, string date,
     BIO *bmem = BIO_new(BIO_s_mem());
     b64 = BIO_push(b64, bmem);
     BIO_write(b64, md, md_len);
+
     // (void) is to silence a warning
     (void) BIO_flush(b64);
     BUF_MEM *bptr;
@@ -897,7 +901,7 @@ int get_headers(const char *path, headers_t &head) {
     string date = get_date();
     headers.append("Date: "+date);
     headers.append("Authorization: AWS " + AWSAccessKeyId + ":" +
-            calc_signature("HEAD", "", date, headers.get(), resource));
+            calc_signature("HEAD", "", "", date, headers.get(), resource));
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers.get());
 
     VERIFY(my_curl_easy_perform((curl.get())));
@@ -919,6 +923,69 @@ int get_headers(const char *path, headers_t &head) {
     }
 
     return 0;
+}
+
+// note: returns a buffer that must be delete[]ed
+unsigned char *get_md5(int fd) {
+    MD5_CTX c;
+    if (MD5_Init(&c) != 1)
+        throw -EIO;
+
+    // start reading the file from the beginning
+    lseek(fd, 0, SEEK_SET);
+
+    int count;
+    char buf[4096];
+    while ((count = read(fd, buf, sizeof(buf))) > 0) {
+        if (MD5_Update(&c, buf, count) != 1)
+            throw -EIO;
+    }
+
+    // leave the file at the beginning so it is ready for uploading
+    lseek(fd, 0, SEEK_SET);
+
+    unsigned char *md = new unsigned char[MD5_DIGEST_LENGTH];
+    if (MD5_Final(md, &c) != 1) {
+        delete[] md;
+        throw -EIO;
+    }
+
+    return md;
+}
+
+string md5_to_string(unsigned char *md) {
+    char localMd5[2 * MD5_DIGEST_LENGTH + 1];
+    sprintf(localMd5,
+            "%02x%02x%02x%02x%02x%02x%02x%02x"
+            "%02x%02x%02x%02x%02x%02x%02x%02x",
+            md[0], md[1], md[2], md[3],
+            md[4], md[5], md[6], md[7],
+            md[8], md[9], md[10], md[11],
+            md[12], md[13], md[14], md[15]);
+
+    string sum(localMd5);
+    return sum;
+}
+
+string base64_encode_md5(unsigned char *md) {
+    BIO *bmem, *b64;
+    BUF_MEM *bptr;
+
+    b64 = BIO_new(BIO_f_base64());
+    bmem = BIO_new(BIO_s_mem());
+    b64 = BIO_push(b64, bmem);
+    BIO_write(b64, md, MD5_DIGEST_LENGTH);
+    BIO_flush(b64);
+    BIO_get_mem_ptr(b64, &bptr);
+
+    char out[MD5_DIGEST_LENGTH * 2];
+    memcpy(out, bptr->data, bptr->length-1);
+    out[bptr->length-1] = 0;
+
+    BIO_free_all(b64);
+
+    string result(out);
+    return result;
 }
 
 /**
@@ -948,28 +1015,14 @@ int get_local_fd(const char *path) {
         fd = open(cache_path.c_str(), O_RDWR);
 
         if (fd >= 0) {
-            MD5_CTX c;
-            if (MD5_Init(&c) != 1)
-                Yikes(-EIO);
-            int count;
-            char buf[4096];
-            while ((count = read(fd, buf, sizeof(buf))) > 0) {
-                if (MD5_Update(&c, buf, count) != 1)
-                    Yikes(-EIO);
+            string localMd5;
+            try {
+                unsigned char *md = get_md5(fd);
+                localMd5 = md5_to_string(md);
+                delete[] md;
+            } catch (int e) {
+                return e;
             }
-            unsigned char md[MD5_DIGEST_LENGTH];
-            if (MD5_Final(md, &c) != 1)
-                Yikes(-EIO);
-
-            char localMd5[2 * MD5_DIGEST_LENGTH + 1];
-            sprintf(localMd5,
-                    "%02x%02x%02x%02x%02x%02x%02x%02x"
-                    "%02x%02x%02x%02x%02x%02x%02x%02x",
-                    md[0], md[1], md[2], md[3],
-                    md[4], md[5], md[6], md[7],
-                    md[8], md[9], md[10], md[11],
-                    md[12], md[13], md[14], md[15]);
-
             string remoteMd5(trim(responseHeaders["ETag"], "\""));
 
             // md5 match?
@@ -1022,7 +1075,7 @@ int get_local_fd(const char *path) {
         string date = get_date();
         headers.append("Date: "+date);
         headers.append("Authorization: AWS " + AWSAccessKeyId + ":" +
-                calc_signature("GET", "", date, headers.get(), resource));
+                calc_signature("GET", "", "", date, headers.get(), resource));
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers.get());
 
 #ifdef DEBUG
@@ -1090,7 +1143,8 @@ int put_headers(const char *path, headers_t head) {
     }
 
     headers.append("Authorization: AWS " + AWSAccessKeyId + ":" +
-            calc_signature("PUT", ContentType, date, headers.get(), resource));
+            calc_signature("PUT", "", ContentType, date, headers.get(),
+                resource));
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers.get());
 
     //###rewind(f);
@@ -1187,6 +1241,7 @@ int generic_put(const char *path, mode_t mode, int fd) {
     curl_easy_setopt(curl, CURLOPT_UPLOAD, true); // HTTP PUT
 
     // set it up to upload the file contents
+    string md5sum;
     string responseText;
     FILE *f = NULL;
     if (fd < 0 || info.size == 0) {
@@ -1194,6 +1249,11 @@ int generic_put(const char *path, mode_t mode, int fd) {
         curl_easy_setopt(curl, CURLOPT_INFILESIZE, 0); // Content-Length: 0
     } else {
         // set it up to upload from a file descriptor
+        unsigned char *md = get_md5(fd);
+        info.etag = md5_to_string(md);
+        md5sum = base64_encode_md5(md);
+        delete[] md;
+
         curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE,
                 static_cast<curl_off_t>(info.size)); // Content-Length
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &responseText);
@@ -1221,6 +1281,8 @@ int generic_put(const char *path, mode_t mode, int fd) {
     auto_curl_slist headers;
     string date = get_date();
     headers.append("Date: " + date);
+    if (md5sum != "")
+        headers.append("Content-MD5: " + md5sum);
     headers.append("Content-Type: " + contentType);
     // x-amz headers: (a) alphabetical order and (b) no spaces after colon
     headers.append("x-amz-acl:" + getAcl(info.mode));
@@ -1229,7 +1291,8 @@ int generic_put(const char *path, mode_t mode, int fd) {
     headers.append("x-amz-meta-mtime:" + str(info.mtime));
     headers.append("x-amz-meta-uid:" + str(info.uid));
     headers.append("Authorization: AWS " + AWSAccessKeyId + ":" +
-            calc_signature("PUT", contentType, date, headers.get(), resource));
+            calc_signature("PUT", md5sum, contentType, date, headers.get(),
+                resource));
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers.get());
 
 #ifdef DEBUG
@@ -1288,7 +1351,7 @@ int generic_remove(const char *path) {
     string date = get_date();
     headers.append("Date: " + date);
     headers.append("Authorization: AWS " + AWSAccessKeyId + ":" +
-            calc_signature("DELETE", "", date, headers.get(), resource));
+            calc_signature("DELETE", "", "", date, headers.get(), resource));
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers.get());
 
     VERIFY(my_curl_easy_perform(curl.get()));
@@ -1587,7 +1650,8 @@ int s3fs_readdir(const char *path, void *buf,
             string date = get_date();
             headers.append("Date: " + date);
             headers.append("Authorization: AWS " + AWSAccessKeyId + ":" +
-                    calc_signature("GET", "", date, headers.get(), resource));
+                    calc_signature("GET", "", "", date, headers.get(),
+                        resource));
 
             curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers.get());
 
