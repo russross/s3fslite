@@ -358,11 +358,13 @@ int my_curl_easy_perform(CURL *curl, FILE *f = 0) {
         if (f)
             rewind(f);
         CURLcode curlCode = curl_easy_perform(curl);
-        if (curlCode == 0)
+        if (curlCode == 0) {
             return 0;
-        else if (curlCode == CURLE_OPERATION_TIMEDOUT)
-            syslog(LOG_ERR, "###timeout");
-        else if (curlCode == CURLE_HTTP_RETURNED_ERROR) {
+        } else if (curlCode == CURLE_OPERATION_TIMEDOUT) {
+#ifdef DEBUG
+            syslog(LOG_INFO, "curl timeout");
+#endif
+        } else if (curlCode == CURLE_HTTP_RETURNED_ERROR) {
             long responseCode;
             if (curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE,
                         &responseCode) != 0)
@@ -371,14 +373,19 @@ int my_curl_easy_perform(CURL *curl, FILE *f = 0) {
             }
             if (responseCode == 404)
                 return -ENOENT;
-            syslog(LOG_ERR, "###response=%ld", responseCode);
+
+            syslog(LOG_ERR, "curl unexpected error code [%ld]", responseCode);
+
             if (responseCode < 500)
                 return -EIO;
-        } else
-            syslog(LOG_ERR, "###%s", curl_easy_strerror(curlCode));;
-        syslog(LOG_ERR, "###retrying...");
+        } else {
+            syslog(LOG_ERR, "curl error[%s]", curl_easy_strerror(curlCode));;
+        }
+#ifdef DEBUG
+        syslog(LOG_INFO, "curl retrying...");
+#endif
     }
-    syslog(LOG_ERR, "###giving up");
+    syslog(LOG_ERR, "curl giving up after %d tries", retries + 1);
     return -EIO;
 }
 
@@ -630,7 +637,7 @@ Fileinfo Attrcache::get(const char *path) {
 
     // error?
     if (status != SQLITE_OK) {
-        syslog(LOG_ERR, "Attrcache::get sqlite error: %s", err);
+        syslog(LOG_ERR, "sqlite error[%s]", err);
         sqlite3_free(err);
         throw -1;
     }
