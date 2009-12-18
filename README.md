@@ -38,13 +38,20 @@ This fork has the following changes:
     correct, which confused browsers when looking at static content
     on an S3 archive.
 
+*   By default, ACLs are set based on the file permission. If the
+    file is publicly readable, the "public-read" ACL is used, which
+    permits anyone to read the file (including web browsers). If
+    not, it defaults to "private", which denies access to public
+    browsers. Setting the "default_acl" option overrides this, and
+    sets everything to the specified ACL.
+
 Everything is started as before. By default, the database is
 created/opened in the current directory (you can change this using
 the `-o attr_cache=` option), and is named "`<bucketname>.sqlite`".
 
 My usual command to mount a system is:
 
-    s3fs <bucket> <mountpoint> -o attr_cache=/var/cache/s3fs -o use_cache=/tmp -o default_acl=public_read -o allow_other
+    s3fs <bucket> <mountpoint> -o attr_cache=/var/cache/s3fs -o use_cache=/tmp -o allow_other
 
 This mounts the file system with a file cache, makes stored files
 publicly browsable, and allows all users of the local machine to use
@@ -66,7 +73,8 @@ The complete list of supported options is:
     default)
 
 *   `default_acl=` specify the access control level for files
-    (default `private`)
+    (default `public-read` for files with public read permissions,
+    `private` for everything else).
 
 *   `retries=` specify the maximum number of times a failed/timed
     out request should be retried (default `2`)
