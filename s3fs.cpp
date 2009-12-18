@@ -31,8 +31,6 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <dirent.h>
-#include <pwd.h>
-#include <grp.h>
 #include <errno.h>
 #include <sys/time.h>
 #include <libgen.h>
@@ -439,6 +437,12 @@ void Fileinfo::toStat(struct stat *info) {
 }
 
 void Fileinfo::updateHeaders(const char *target) {
+    // special case: for the root, just update the cache
+    if (path == "/") {
+        attrcache->set(*this);
+        return;
+    }
+
     headers_t head;
     head["x-amz-copy-source"] = urlEncode("/" + bucket + path);
     head["x-amz-meta-uid"] = str(uid);
@@ -591,9 +595,7 @@ Fileinfo Attrcache::get(const char *path) {
 
     // error?
     if (status != SQLITE_OK) {
-        string msg("Attrcache:get sqlite error: ");
-        msg += err;
-        syslog(LOG_ERR, msg.c_str());
+        syslog(LOG_ERR, "Attrcache::get sqlite error: %s", err);
         sqlite3_free(err);
         throw -1;
     }
@@ -758,7 +760,8 @@ string calc_signature(string method, string content_type, string date,
     BIO *bmem = BIO_new(BIO_s_mem());
     b64 = BIO_push(b64, bmem);
     BIO_write(b64, md, md_len);
-    BIO_flush(b64);
+    // (void) is to silence a warning
+    (void) BIO_flush(b64);
     BUF_MEM *bptr;
     BIO_get_mem_ptr(b64, &bptr);
 
@@ -1162,7 +1165,7 @@ int s3fs_readlink(const char *path, char *buf, size_t size) {
         if (fstat(fd.get(), &st) == -1)
             Yikes(-errno);
 
-        if (st.st_size < size)
+        if ((size_t) st.st_size < size)
             size = st.st_size;
 
         if (pread(fd.get(), buf, size, 0) == -1)
@@ -1366,9 +1369,9 @@ int s3fs_chown(const char *path, uid_t uid, gid_t gid) {
         Fileinfo info = get_fileinfo(path);
 
         // uid or gid < 0 indicates no change
-        if (uid >= 0)
+        if ((int) uid >= 0)
             info.uid = uid;
-        if (gid >= 0)
+        if ((int) gid >= 0)
             info.gid = gid;
 
         info.updateHeaders();
@@ -1765,7 +1768,7 @@ int my_fuse_opt_proc(void *data, const char *arg,
 struct fuse_operations s3fs_oper;
 
 int main(int argc, char *argv[]) {
-    memset(&s3fs_oper, sizeof(s3fs_oper), 0);
+    bzero(&s3fs_oper, sizeof(s3fs_oper));
 
     struct fuse_args custom_args = FUSE_ARGS_INIT(argc, argv);
     fuse_opt_parse(&custom_args, NULL, NULL, my_fuse_opt_proc);

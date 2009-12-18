@@ -1,6 +1,6 @@
 CPP=g++
 
-CPPFLAGS=-ggdb -Wall \
+CPPFLAGS=-ggdb -Wall -Wextra -Wno-unused-parameter -Os \
 	$(shell pkg-config fuse --cflags) \
 	$(shell pkg-config libcurl --cflags) \
 	$(shell pkg-config sqlite3 --cflags) \
