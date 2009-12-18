@@ -23,23 +23,7 @@
 
 #define FUSE_USE_VERSION 26
 
-#include <fuse.h>
-#include <sqlite3.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <dirent.h>
-#include <errno.h>
-#include <sys/time.h>
-#include <libgen.h>
-#include <pthread.h>
-#include <curl/curl.h>
-#include <libxml/parser.h>
-#include <libxml/tree.h>
-#include <syslog.h>
-
+// C++ standard library
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -48,12 +32,34 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+
+// C and Unix libraries
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <strings.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <errno.h>
+#include <syslog.h>
+#include <sys/time.h>
+#include <pthread.h>
+#include <libgen.h>
+
+// non-standard dependencies
+#include <libxml/parser.h>
+#include <libxml/tree.h>
+#include <curl/curl.h>
+#include <openssl/md5.h>
+#include <openssl/bio.h>
+#include <openssl/buffer.h>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <fuse.h>
+#include <sqlite3.h>
 
 using namespace std;
-
-long connect_timeout = 2;
-time_t readwrite_timeout = 10;
 
 #define MAX_KEYS_PER_DIR_REQUEST "200"
 #define DEFAULT_MIME_TYPE "application/octet-stream"
@@ -69,6 +75,29 @@ time_t readwrite_timeout = 10;
     syslog(LOG_ERR, "yikes[%s] line[%u]", strerror(result), __LINE__); \
     return result; \
 } while (0)
+
+// config parameters
+string bucket;
+string AWSAccessKeyId;
+string AWSSecretAccessKey;
+string host = "http://s3.amazonaws.com";
+mode_t root_mode = 0755;
+
+// if .size()==0 then local file cache is disabled
+string use_cache;
+string attr_cache;
+
+// private, public-read, public-read-write, authenticated-read
+string default_acl;
+string private_acl("private");
+string public_acl("public-read");
+
+// -oretries=2
+int retries = 2;
+
+long connect_timeout = 2;
+time_t readwrite_timeout = 10;
+
 
 class auto_fd {
     int fd;
@@ -128,11 +157,14 @@ typedef pair<double, double> progress_t;
 map<CURL*, time_t> curl_times;
 map<CURL*, progress_t> curl_progress;
 
+pthread_mutex_t *mutex_buf = NULL;
+
 // http headers
 typedef map<string, string> headers_t;
 
 int get_headers(const char *path, headers_t &head);
 int put_headers(const char *path, headers_t head);
+int generic_put(const char *path, mode_t mode, int fd = -1);
 
 const char hexAlphabet[] = "0123456789ABCDEF";
 
@@ -170,6 +202,11 @@ struct case_insensitive_compare_func {
 typedef map<string, string, case_insensitive_compare_func> mimes_t;
 
 mimes_t mimeTypes;
+
+// fd -> flags
+typedef map<int, int> s3fs_descriptors_t;
+s3fs_descriptors_t s3fs_descriptors;
+pthread_mutex_t s3fs_descriptors_lock;
 
 /**
  * @param s e.g., "index.html"
@@ -311,9 +348,6 @@ public:
     }
 };
 
-// -oretries=2
-int retries = 2;
-
 /**
  * @return fuse return code
  */
@@ -347,21 +381,6 @@ int my_curl_easy_perform(CURL *curl, FILE *f = 0) {
     syslog(LOG_ERR, "###giving up");
     return -EIO;
 }
-
-string bucket;
-string AWSAccessKeyId;
-string AWSSecretAccessKey;
-string host = "http://s3.amazonaws.com";
-mode_t root_mode = 0755;
-
-// if .size()==0 then local file cache is disabled
-string use_cache;
-string attr_cache;
-
-// private, public-read, public-read-write, authenticated-read
-string default_acl;
-string private_acl("private");
-string public_acl("public-read");
 
 string getAcl(mode_t mode) {
     if (default_acl != "")
@@ -503,6 +522,8 @@ Fileinfo get_fileinfo(const char *path) {
     headers_t head;
 
     int status = get_headers(path, head);
+
+    // if we could not get the headers, assume it does not exist
     if (status)
         throw status;
 
@@ -712,11 +733,6 @@ class Filecache {
 
 };
 
-#include <openssl/bio.h>
-#include <openssl/buffer.h>
-#include <openssl/evp.h>
-#include <openssl/hmac.h>
-
 const EVP_MD *evp_md = EVP_sha1();
 
 /**
@@ -748,14 +764,14 @@ string calc_signature(string method, string content_type, string date,
     StringToSign += content_type + "\n";
     StringToSign += date + "\n";
     int count = 0;
-    if (headers != 0) {
-        do {
-            if (strncmp(headers->data, "x-amz", 5) == 0) {
-                ++count;
-                StringToSign += headers->data;
-                StringToSign += 10; // linefeed
-            }
-        } while ((headers = headers->next) != 0);
+
+    while (headers) {
+        if (strncmp(headers->data, "x-amz", 5) == 0) {
+            count++;
+            StringToSign += headers->data;
+            StringToSign += 10; // linefeed
+        }
+        headers = headers->next;
     }
     StringToSign += resource;
 
@@ -846,8 +862,6 @@ int mkdirp(const string &path, mode_t mode) {
     }
     return 0;
 }
-
-#include <openssl/md5.h>
 
 /**
  * @return fuse return code
@@ -1084,75 +1098,6 @@ int put_headers(const char *path, headers_t head) {
     return 0;
 }
 
-/**
- * create or update s3 object
- * @return fuse return code
- */
-int put_local_fd(const char *path, headers_t head, int fd) {
-    string resource = urlEncode("/" + bucket + path);
-    string url = host + resource;
-
-    struct stat st;
-    if (fstat(fd, &st) == -1)
-        Yikes(-errno);
-
-    auto_curl curl;
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_FAILONERROR, true);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, true);
-
-    string responseText;
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &responseText);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
-
-    curl_easy_setopt(curl, CURLOPT_UPLOAD, true); // HTTP PUT
-    curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE,
-            static_cast<curl_off_t>(st.st_size)); // Content-Length
-
-    int dupfd = dup(fd);
-    FILE *f = fdopen(dupfd, "rb");
-    if (!f)
-        Yikes(-errno);
-    curl_easy_setopt(curl, CURLOPT_INFILE, f);
-
-    string ContentType = head["Content-Type"];
-
-    auto_curl_slist headers;
-    string date = get_date();
-    headers.append("Date: " + date);
-
-    head["x-amz-acl"] =
-        getAcl(strtoul(head["x-amz-meta-mode"].c_str(), NULL, 10));
-
-    for (headers_t::iterator iter = head.begin(); iter != head.end(); ++iter) {
-        string key = (*iter).first;
-        string value = (*iter).second;
-        if (key == "Content-Type")
-            headers.append(key + ":" + value);
-        if (key.substr(0, 9) == "x-amz-acl")
-            headers.append(key + ":" + value);
-        if (key.substr(0, 10) == "x-amz-meta")
-            headers.append(key + ":" + value);
-    }
-
-    headers.append("Authorization: AWS " + AWSAccessKeyId + ":" +
-            calc_signature("PUT", ContentType, date, headers.get(), resource));
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers.get());
-
-    //###rewind(f);
-
-#ifdef DEBUG
-    syslog(LOG_INFO, "uploading[%s] size[%llu]", path, st.st_size);
-#endif
-
-    VERIFY(my_curl_easy_perform(curl.get(), f));
-
-    // close the dup fd and FILE *; leave the original fd alone
-    fclose(f);
-
-    return 0;
-}
-
 int s3fs_getattr(const char *path, struct stat *stbuf) {
 #ifdef DEBUG
     syslog(LOG_INFO, "getattr[%s]", path);
@@ -1165,7 +1110,7 @@ int s3fs_getattr(const char *path, struct stat *stbuf) {
     } catch (int e) {
         if (e == -ENOENT) {
 #ifdef DEBUG
-            syslog(LOG_INFO, "getattr[%s]: %s", path, strerror(e));
+            syslog(LOG_INFO, "getattr[%s]: File not found", path);
 #endif
         } else {
             syslog(LOG_INFO, "getattr[%s]: %s", path, strerror(e));
@@ -1201,22 +1146,64 @@ int s3fs_readlink(const char *path, char *buf, size_t size) {
 }
 
 // create a new file/directory
-int generic_create(const char *path, mode_t mode) {
-    attrcache->del(path);
-
+int generic_put(const char *path, mode_t mode, int fd) {
     string resource = urlEncode("/" + bucket + path);
     string url = host + resource;
+
+    // start with generic stats for a new, empty file
+    Fileinfo info(path, getuid(), getgid(), mode, time(NULL), 0, MD5_EMPTY);
+
+    // does this file have existing stats?
+    try {
+        info = get_fileinfo(path);
+        info.mode = mode;
+    } catch (int e) {
+        // if it does not exist, that is okay. other errors are a problem
+        if (e != -ENOENT)
+            return e;
+    }
+
+    // does this file have contents to be transmitted?
+    if (fd >= 0) {
+        struct stat st;
+        if (fstat(fd, &st) < 0)
+            return -errno;
+
+        // for now just grab the size
+        info.size = st.st_size;
+    }
 
     auto_curl curl;
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_FAILONERROR, true);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, true);
     curl_easy_setopt(curl, CURLOPT_UPLOAD, true); // HTTP PUT
-    curl_easy_setopt(curl, CURLOPT_INFILESIZE, 0); // Content-Length: 0
 
-    auto_curl_slist headers;
-    string date = get_date();
-    headers.append("Date: " + date);
+    // set it up to upload the file contents
+    string responseText;
+    FILE *f = NULL;
+    if (fd < 0 || info.size == 0) {
+        // easy case--no contents
+        curl_easy_setopt(curl, CURLOPT_INFILESIZE, 0); // Content-Length: 0
+    } else {
+        // set it up to upload from a file descriptor
+        curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE,
+                static_cast<curl_off_t>(info.size)); // Content-Length
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &responseText);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
+
+        // dup the file descriptor and make a FILE * out of it
+        int dupfd = dup(fd);
+        if (dupfd < 0)
+            Yikes(-errno);
+
+        f = fdopen(dupfd, "rb");
+        if (!f) {
+            close(dupfd);
+            Yikes(-errno);
+        }
+        curl_easy_setopt(curl, CURLOPT_INFILE, f);
+    }
 
     string contentType(DEFAULT_MIME_TYPE);
     if (mode & S_IFDIR)
@@ -1224,8 +1211,9 @@ int generic_create(const char *path, mode_t mode) {
     else if (mode & S_IFREG)
         contentType = lookupMimeType(path);
 
-    Fileinfo info(path, getuid(), getgid(), mode, time(NULL), 0, MD5_EMPTY);
-
+    auto_curl_slist headers;
+    string date = get_date();
+    headers.append("Date: " + date);
     headers.append("Content-Type: " + contentType);
     // x-amz headers: (a) alphabetical order and (b) no spaces after colon
     headers.append("x-amz-acl:" + getAcl(info.mode));
@@ -1237,7 +1225,20 @@ int generic_create(const char *path, mode_t mode) {
             calc_signature("PUT", contentType, date, headers.get(), resource));
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers.get());
 
+#ifdef DEBUG
+    if (fd >= 0 && info.size > 0) {
+        syslog(LOG_INFO, "uploading[%s] size[%llu]", path,
+                (unsigned long long) info.size);
+    }
+#endif
+
+    attrcache->del(path);
+
     VERIFY(my_curl_easy_perform(curl.get()));
+
+    // close the dup fd and FILE *; leave the original fd alone
+    if (f)
+        fclose(f);
 
     attrcache->set(info);
 
@@ -1253,7 +1254,7 @@ int s3fs_mknod(const char *path, mode_t mode, dev_t rdev) {
     // If pathname already exists, or is a symbolic link,
     // this call fails with an EEXIST error.
 
-    return generic_create(path, mode | S_IFREG);
+    return generic_put(path, mode | S_IFREG);
 }
 
 int s3fs_mkdir(const char *path, mode_t mode) {
@@ -1261,7 +1262,7 @@ int s3fs_mkdir(const char *path, mode_t mode) {
     syslog(LOG_INFO, "mkdir[%s] mode[0%o]", path, mode);
 #endif
 
-    return generic_create(path, mode | S_IFDIR);
+    return generic_put(path, mode | S_IFDIR);
 }
 
 int generic_remove(const char *path) {
@@ -1309,20 +1310,20 @@ int s3fs_symlink(const char *from, const char *to) {
     syslog(LOG_INFO, "symlink[%s] -> [%s]", from, to);
 #endif
 
-    attrcache->del(from);
+    // put the link target into a file
+    FILE *fp = tmpfile();
+    int fd = fileno(fp);
 
-    headers_t headers;
-    headers["x-amz-meta-mode"] = str(S_IFLNK);
-    headers["x-amz-meta-mtime"] = str(time(NULL));
-
-    auto_fd fd(fileno(tmpfile()));
-
-    if (pwrite(fd.get(), from, strlen(from), 0) == -1)
+    if (pwrite(fd, from, strlen(from), 0) == -1) {
+        fclose(fp);
         Yikes(-errno);
+    }
 
-    VERIFY(put_local_fd(to, headers, fd.get()));
+    int result = generic_put(to, S_IFLNK, fd);
 
-    return 0;
+    fclose(fp);
+
+    return result;
 }
 
 int s3fs_rename(const char *from, const char *to) {
@@ -1414,24 +1415,18 @@ int s3fs_truncate(const char *path, off_t size) {
     syslog(LOG_INFO, "truncate[%s] size[%llu]", path, size);
 #endif
 
-    //###TODO honor size?!?
+    if (size != 0)
+        return -ENOTSUP;
 
-    attrcache->del(path);
-
-    // preserve headers across truncate
-    headers_t head;
-    VERIFY(get_headers(path, head));
-    auto_fd fd(fileno(tmpfile()));
-    //###verify fd here?!?
-    VERIFY(put_local_fd(path, head, fd.get()));
-
-    return 0;
+    // this is just like creating a new file of length zero,
+    // but keeping the old attributes
+    try {
+        Fileinfo info = get_fileinfo(path);
+        return generic_put(path, info.mode);
+    } catch (int e) {
+        return e;
+    }
 }
-
-// fd -> flags
-typedef map<int, int> s3fs_descriptors_t;
-s3fs_descriptors_t s3fs_descriptors;
-pthread_mutex_t s3fs_descriptors_lock;
 
 int s3fs_open(const char *path, struct fuse_file_info *fi) {
 #ifdef DEBUG
@@ -1469,8 +1464,6 @@ int s3fs_write(const char *path, const char *buf,
     syslog(LOG_INFO, "write[%s] size[%u] offset[%llu]", path, size, offset);
 #endif
 
-    attrcache->del(path);
-
     int res = pwrite(fi->fh, buf, size, offset);
     if (res == -1)
         Yikes(-errno);
@@ -1501,14 +1494,21 @@ int s3fs_flush(const char *path, struct fuse_file_info *fi) {
 #endif
 
     int fd = fi->fh;
-    // NOTE- fi->flags is not available here
+
+    // fi->flags is not available here
     int flags = get_flags(fd);
-    if ((flags & O_RDWR) || (flags &  O_WRONLY)) {
-        headers_t head;
-        VERIFY(get_headers(path, head));
-        head["x-amz-meta-mtime"]=str(time(NULL));
-        return put_local_fd(path, head, fd);
+
+    // if it was opened with write permission, assume it has changed
+    if ((flags & O_RDWR) || (flags & O_WRONLY)) {
+        try {
+            Fileinfo info = get_fileinfo(path);
+            return generic_put(path, info.mode, fd);
+        } catch (int e) {
+            return e;
+        }
     }
+
+    // nothing to do
     return 0;
 }
 
@@ -1635,8 +1635,6 @@ int s3fs_readdir(const char *path, void *buf,
 
     return 0;
 }
-
-pthread_mutex_t *mutex_buf = NULL;
 
 /**
  * OpenSSL locking function.
