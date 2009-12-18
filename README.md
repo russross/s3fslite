@@ -38,15 +38,14 @@ This fork has the following changes:
     correct, which confused browsers when looking at static content
     on an S3 archive.
 
-Everything is started as before. At present, the database is
-created/opened in the current directory (I'll probably make this an
-option eventually), and is named "`<bucketname>.db`".
+Everything is started as before. By default, the database is
+created/opened in the current directory (you can change this using
+the `-o attr_cache=` option), and is named "`<bucketname>.sqlite`".
 
 My usual command to mount a system is:
 
-    s3fs <bucket> <mountpoint> -o use_cache=/tmp -o default_acl=public_read -o allow_other
+    s3fs <bucket> <mountpoint> -o attr_cache=/var/cache/s3fs -o use_cache=/tmp -o default_acl=public_read -o allow_other
 
-... executed from the directory where my cache database is located.
 This mounts the file system with a file cache, makes stored files
 publicly browsable, and allows all users of the local machine to use
 the mount.
@@ -58,6 +57,35 @@ I also put my S3 access key and secret access key in
 
 s3fs knows to look for it there, so you do not have to provide it on
 the command line.
+
+The complete list of supported options is:
+
+*   `accessKeyId=` specify the Amazon AWS access key (no default)
+
+*   `secretAccessKey=` specify the Amazon AWS secret access key (no
+    default)
+
+*   `default_acl=` specify the access control level for files
+    (default `private`)
+
+*   `retries=` specify the maximum number of times a failed/timed
+    out request should be retried (default `2`)
+
+*   `use_cache=` specify the directory for (and enable) a file cache
+    (default no cache)
+
+*   `connect_timeout=` specify the timeout interval for request
+    connections (default `2`)
+
+*   `readwrite_timeout=` specify the timeout interval for read and
+    write operations (default `10`)
+
+*   `url=` specify the host to connect to (default
+    `http://s3.amazonaws.com`)
+
+*   `attr_cache=` specify the directory where the attribute cache
+    database should be created and accessed (default current
+    directory)
 
 And now for the README that was included with the original code
 (with a few updates):
