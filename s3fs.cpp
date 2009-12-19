@@ -1,9 +1,10 @@
 /*
- * s3fslite - FUSE-based file system backed by Amazon S3
+ * s3fslite - Amazon S3 file system
  *
+ * Copyright 2009 Russ Ross <russ@russross.com>
+ *
+ * Based on s3fs
  * Copyright 2007-2008 Randy Rizun <rrizun@gmail.com>
- *
- * Some parts Copyright 2009 Russ Ross <russ@russross.com>
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -98,17 +99,17 @@ int retries = 2;
 long connect_timeout = 2;
 time_t readwrite_timeout = 10;
 
-
 class auto_fd {
-    int fd;
-public:
-    auto_fd(int fd): fd(fd) {}
-    ~auto_fd() {
-        close(fd);
-    }
-    int get() {
-        return fd;
-    }
+    private:
+        int fd;
+    public:
+        auto_fd(int fd): fd(fd) {}
+        ~auto_fd() {
+            close(fd);
+        }
+        int get() {
+            return fd;
+        }
 };
 
 template<typename T>
@@ -118,44 +119,46 @@ string str(T value) {
     return tmp.str();
 }
 
-#define SPACES " \t\r\n"
+const char *SPACES = " \t\r\n";
 
-inline string trim_left (const string & s, const string & t = SPACES) {
+inline string trim_left (const string &s, const string &t = SPACES) {
     string d (s);
     return d.erase (0, s.find_first_not_of (t)) ;
-}  // end of trim_left
+}
 
-inline string trim_right (const string & s, const string & t = SPACES) {
+inline string trim_right (const string &s, const string &t = SPACES) {
     string d (s);
     string::size_type i (d.find_last_not_of (t));
     if (i == string::npos)
         return "";
     else
         return d.erase (d.find_last_not_of (t) + 1) ;
-}  // end of trim_right
+}
 
 inline string trim (const string & s, const string & t = SPACES) {
     string d (s);
     return trim_left (trim_right (d, t), t) ;
-}  // end of trim
+}
 
 class auto_lock {
-    pthread_mutex_t& lock;
-public:
-    auto_lock(pthread_mutex_t& lock): lock(lock) {
-        pthread_mutex_lock(&lock);
-    }
-    ~auto_lock() {
-        pthread_mutex_unlock(&lock);
-    }
+    private:
+        pthread_mutex_t& lock;
+
+    public:
+        auto_lock(pthread_mutex_t& lock): lock(lock) {
+            pthread_mutex_lock(&lock);
+        }
+        ~auto_lock() {
+            pthread_mutex_unlock(&lock);
+        }
 };
 
-stack<CURL*> curl_handles;
+stack<CURL *> curl_handles;
 pthread_mutex_t curl_handles_lock;
 
 typedef pair<double, double> progress_t;
-map<CURL*, time_t> curl_times;
-map<CURL*, progress_t> curl_progress;
+map<CURL *, time_t> curl_times;
+map<CURL *, progress_t> curl_progress;
 
 pthread_mutex_t *mutex_buf = NULL;
 
@@ -164,9 +167,10 @@ typedef map<string, string> headers_t;
 
 int get_headers(const char *path, headers_t &head);
 int put_headers(const char *path, headers_t head);
-int generic_put(const char *path, mode_t mode, int fd = -1);
+int generic_put(const char *path, mode_t mode,
+        bool newfile, int fd = -1);
 
-const char hexAlphabet[] = "0123456789ABCDEF";
+const char *hexAlphabet = "0123456789ABCDEF";
 
 /**
  * urlEncode a fuse path,
@@ -193,10 +197,11 @@ string urlEncode(const string &s) {
     return result;
 }
 
-struct case_insensitive_compare_func {
-    bool operator ()(const string &a, const string &b) {
-        return strcasecmp(a.c_str(), b.c_str()) < 0;
-    }
+class case_insensitive_compare_func {
+    public:
+        bool operator ()(const string &a, const string &b) {
+            return strcasecmp(a.c_str(), b.c_str()) < 0;
+        }
 };
 
 typedef map<string, string, case_insensitive_compare_func> mimes_t;
@@ -204,8 +209,7 @@ typedef map<string, string, case_insensitive_compare_func> mimes_t;
 mimes_t mimeTypes;
 
 // fd -> flags
-typedef map<int, int> s3fs_descriptors_t;
-s3fs_descriptors_t s3fs_descriptors;
+map<int, int> s3fs_descriptors;
 pthread_mutex_t s3fs_descriptors_lock;
 
 /**
@@ -249,86 +253,32 @@ int my_curl_progress(void *clientp, double dltotal,
     return 0;
 }
 
-CURL *alloc_curl_handle() {
-    CURL *curl;
-    auto_lock lock(curl_handles_lock);
-    if (curl_handles.size() == 0)
-        curl = curl_easy_init();
-    else {
-        curl = curl_handles.top();
-        curl_handles.pop();
-    }
-    curl_easy_reset(curl);
-    long signal = 1;
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, signal);
-
-    //  long timeout = 3600;
-    //  curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout);
-
-    //###long seconds = 10;
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, connect_timeout);
-
-    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0);
-    curl_easy_setopt(curl, CURLOPT_PROGRESSFUNCTION, my_curl_progress);
-    curl_easy_setopt(curl, CURLOPT_PROGRESSDATA, curl);
-    time_t now = time(0);
-    curl_times[curl] = now;
-    curl_progress[curl] = progress_t(-1, -1);
-    return curl;
-}
-
-void return_curl_handle(CURL *curl_handle) {
-    if (curl_handle != 0) {
-        auto_lock lock(curl_handles_lock);
-        curl_handles.push(curl_handle);
-        curl_times.erase(curl_handle);
-        curl_progress.erase(curl_handle);
-    }
-}
-
 class auto_curl {
     CURL* curl_handle;
 public:
-    auto_curl(): curl_handle(alloc_curl_handle()) {
+    auto_curl() {
+        curl_handle = curl_easy_init();
+
+        // set up flags
+        long signal = 1;
+        curl_easy_setopt(curl_handle, CURLOPT_NOSIGNAL, signal);
+        curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT, connect_timeout);
+        curl_easy_setopt(curl_handle, CURLOPT_NOPROGRESS, 0);
+        curl_easy_setopt(curl_handle, CURLOPT_PROGRESSFUNCTION,
+                my_curl_progress);
+        curl_easy_setopt(curl_handle, CURLOPT_PROGRESSDATA, curl_handle);
+        time_t now = time(0);
+        curl_times[curl_handle] = now;
+        curl_progress[curl_handle] = progress_t(-1, -1);
     }
     ~auto_curl() {
-        if (curl_handle != 0)
-            return_curl_handle(curl_handle);
+        curl_easy_cleanup(curl_handle);
     }
     CURL* get() const {
         return curl_handle;
     }
     operator CURL*() const {
         return curl_handle;
-    }
-};
-
-struct curl_multi_remove_handle_functor {
-    CURLM *multi_handle;
-    curl_multi_remove_handle_functor(CURLM *multi_handle):
-        multi_handle(multi_handle) {}
-    void operator()(CURL *curl_handle) {
-        curl_multi_remove_handle(multi_handle, curl_handle);
-        return_curl_handle(curl_handle);
-    }
-};
-
-class auto_curl_multi {
-    CURLM *multi_handle;
-    vector<CURL *> curl_handles;
-public:
-    auto_curl_multi(): multi_handle(curl_multi_init()) {}
-    ~auto_curl_multi() {
-        curl_multi_cleanup(for_each(curl_handles.begin(), curl_handles.end(),
-                    curl_multi_remove_handle_functor(multi_handle)).
-                multi_handle);
-    }
-    CURLM *get() const {
-        return multi_handle;
-    }
-    void add_curl(CURL *curl_handle) {
-        curl_handles.push_back(curl_handle);
-        curl_multi_add_handle(multi_handle, curl_handle);
     }
 };
 
@@ -975,7 +925,9 @@ string base64_encode_md5(unsigned char *md) {
     bmem = BIO_new(BIO_s_mem());
     b64 = BIO_push(b64, bmem);
     BIO_write(b64, md, MD5_DIGEST_LENGTH);
-    BIO_flush(b64);
+
+    // (void) is to silence a warning
+    (void) BIO_flush(b64);
     BIO_get_mem_ptr(b64, &bptr);
 
     char out[MD5_DIGEST_LENGTH * 2];
@@ -1001,18 +953,12 @@ int get_local_fd(const char *path) {
 
     string baseName = mybasename(path);
     string resolved_path(use_cache + "/" + bucket);
-
-    int fd = -1;
-
     string cache_path(resolved_path + path);
 
-    headers_t responseHeaders;
+    Fileinfo info = get_fileinfo(path);
 
     if (use_cache.size() > 0) {
-        VERIFY(get_headers(path, responseHeaders));
-
-        // ### TODO should really somehow obey flags here
-        fd = open(cache_path.c_str(), O_RDWR);
+        int fd = open(cache_path.c_str(), O_RDWR);
 
         if (fd >= 0) {
             string localMd5;
@@ -1023,75 +969,64 @@ int get_local_fd(const char *path) {
             } catch (int e) {
                 return e;
             }
-            string remoteMd5(trim(responseHeaders["ETag"], "\""));
+            string remoteMd5(trim(info.etag, "\""));
 
             // md5 match?
-            if (string(localMd5) != remoteMd5) {
-                // no! prepare to download
-                if (close(fd) == -1)
-                    Yikes(-errno);
-                fd = -1;
-            }
+            if (localMd5 == remoteMd5)
+                return fd;
+
+            // no! prepare to download
+            if (close(fd) < 0)
+                Yikes(-errno);
         }
     }
 
-    // need to download?
-    if (fd == -1) {
-        // yes!
+    // need to download
+    int fd;
+    if (use_cache.size() > 0) {
+        // assume creating dirs in the cache succeeds
+        mkdirp(resolved_path + mydirname(path), 0777);
+        fd = open(cache_path.c_str(), O_CREAT|O_RDWR|O_TRUNC, info.mode);
+    } else {
+        // always start from scratch when cache is turned off
+        fd = fileno(tmpfile());
+    }
 
-        if (use_cache.size() > 0) {
-            // only download files, not folders
-            // TODO: handle missing metadata more gracefully
-            mode_t mode = strtoul(responseHeaders["x-amz-meta-mode"].c_str(),
-                    (char **) NULL, 10);
-            if (S_ISREG(mode)) {
-                // assume creating dirs in the cache succeeds ...
-                mkdirp(resolved_path + mydirname(path), 0777);
-                fd = open(cache_path.c_str(), O_CREAT|O_RDWR|O_TRUNC, mode);
-            } else {
-                // its a folder; do *not* create anything in local cache...
-                // (###TODO do this in a better way)
-                fd = fileno(tmpfile());
-            }
-        } else {
-            fd = fileno(tmpfile());
-        }
+    if (fd < 0)
+        Yikes(-errno);
 
-        if (fd == -1)
-            Yikes(-errno);
+    // zero-length files are easy to download
+    if (info.size == 0)
+        return fd;
 
-        auto_curl curl;
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_FAILONERROR, true);
-        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, true);
+    // download the file
+    auto_curl curl;
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_FAILONERROR, true);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, true);
 
-        int dupfd = dup(fd);
-        FILE *f = fdopen(dupfd, "w+");
-        if (!f)
-            Yikes(-errno);
-        curl_easy_setopt(curl, CURLOPT_FILE, f);
+    int dupfd = dup(fd);
+    FILE *f = fdopen(dupfd, "w+");
+    if (!f)
+        Yikes(-errno);
+    curl_easy_setopt(curl, CURLOPT_FILE, f);
 
-        auto_curl_slist headers;
-        string date = get_date();
-        headers.append("Date: "+date);
-        headers.append("Authorization: AWS " + AWSAccessKeyId + ":" +
-                calc_signature("GET", "", "", date, headers.get(), resource));
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers.get());
+    auto_curl_slist headers;
+    string date = get_date();
+    headers.append("Date: "+date);
+    headers.append("Authorization: AWS " + AWSAccessKeyId + ":" +
+            calc_signature("GET", "", "", date, headers.get(), resource));
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers.get());
 
 #ifdef DEBUG
-        syslog(LOG_INFO, "downloading[%s]", path);
+    syslog(LOG_INFO, "downloading[%s]", path);
 #endif
 
-        VERIFY(my_curl_easy_perform(curl.get(), f));
+    VERIFY(my_curl_easy_perform(curl.get(), f));
 
-        fflush(f);
-
-        // close the FILE * and the dup fd; the original fd is not closed
-        fclose(f);
-
-        if (fd == -1)
-            Yikes(-errno);
-    }
+    // close the FILE * and the dup fd; the original fd is not closed
+    fflush(f);
+    fclose(f);
 
     return fd;
 }
@@ -1185,29 +1120,34 @@ int s3fs_readlink(const char *path, char *buf, size_t size) {
     syslog(LOG_INFO, "readlink[%s]", path);
 #endif
 
-    if (size > 0) {
-        size--; // reserve nil terminator
+    if (size == 0)
+        return 0;
+
+    try {
+        size--; // save room for null at the end
 
         auto_fd fd(get_local_fd(path));
 
         struct stat st;
-        if (fstat(fd.get(), &st) == -1)
+        if (fstat(fd.get(), &st) < 0)
             Yikes(-errno);
 
         if ((size_t) st.st_size < size)
             size = st.st_size;
 
-        if (pread(fd.get(), buf, size, 0) == -1)
+        if (pread(fd.get(), buf, size, 0) < 0)
             Yikes(-errno);
 
         buf[size] = 0;
+    } catch (int e) {
+        return e;
     }
 
     return 0;
 }
 
 // create a new file/directory
-int generic_put(const char *path, mode_t mode, int fd) {
+int generic_put(const char *path, mode_t mode, bool newfile, int fd) {
     string resource = urlEncode("/" + bucket + path);
     string url = host + resource;
 
@@ -1215,13 +1155,15 @@ int generic_put(const char *path, mode_t mode, int fd) {
     Fileinfo info(path, getuid(), getgid(), mode, time(NULL), 0, MD5_EMPTY);
 
     // does this file have existing stats?
-    try {
-        info = get_fileinfo(path);
-        info.mode = mode;
-    } catch (int e) {
-        // if it does not exist, that is okay. other errors are a problem
-        if (e != -ENOENT)
-            return e;
+    if (!newfile) {
+        try {
+            info = get_fileinfo(path);
+            info.mode = mode;
+        } catch (int e) {
+            // if it does not exist, that is okay. other errors are a problem
+            if (e != -ENOENT)
+                return e;
+        }
     }
 
     // does this file have contents to be transmitted?
@@ -1324,7 +1266,7 @@ int s3fs_mknod(const char *path, mode_t mode, dev_t rdev) {
     // If pathname already exists, or is a symbolic link,
     // this call fails with an EEXIST error.
 
-    return generic_put(path, mode | S_IFREG);
+    return generic_put(path, mode | S_IFREG, true);
 }
 
 int s3fs_mkdir(const char *path, mode_t mode) {
@@ -1332,7 +1274,7 @@ int s3fs_mkdir(const char *path, mode_t mode) {
     syslog(LOG_INFO, "mkdir[%s] mode[0%o]", path, mode);
 #endif
 
-    return generic_put(path, mode | S_IFDIR);
+    return generic_put(path, mode | S_IFDIR, true);
 }
 
 int generic_remove(const char *path) {
@@ -1340,6 +1282,14 @@ int generic_remove(const char *path) {
 
     string resource = urlEncode("/" + bucket + path);
     string url = host + resource;
+
+    string baseName = mybasename(path);
+    string resolved_path(use_cache + "/" + bucket);
+    string cache_path(resolved_path + path);
+
+    // delete the cache copy if it exists
+    if (use_cache.size() > 0)
+        unlink(cache_path.c_str());
 
     auto_curl curl;
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
@@ -1384,12 +1334,12 @@ int s3fs_symlink(const char *from, const char *to) {
     FILE *fp = tmpfile();
     int fd = fileno(fp);
 
-    if (pwrite(fd, from, strlen(from), 0) == -1) {
+    if (pwrite(fd, from, strlen(from), 0) < 0) {
         fclose(fp);
         Yikes(-errno);
     }
 
-    int result = generic_put(to, S_IFLNK, fd);
+    int result = generic_put(to, S_IFLNK, true, fd);
 
     fclose(fp);
 
@@ -1482,9 +1432,11 @@ int s3fs_chown(const char *path, uid_t uid, gid_t gid) {
 
 int s3fs_truncate(const char *path, off_t size) {
 #ifdef DEBUG
-    syslog(LOG_INFO, "truncate[%s] size[%llu]", path, size);
+    syslog(LOG_INFO, "truncate[%s] size[%llu]", path,
+            (unsigned long long) size);
 #endif
 
+    // TODO: support all sizes of truncates
     if (size != 0)
         return -ENOTSUP;
 
@@ -1492,7 +1444,7 @@ int s3fs_truncate(const char *path, off_t size) {
     // but keeping the old attributes
     try {
         Fileinfo info = get_fileinfo(path);
-        return generic_put(path, info.mode);
+        return generic_put(path, info.mode, false);
     } catch (int e) {
         return e;
     }
@@ -1504,12 +1456,16 @@ int s3fs_open(const char *path, struct fuse_file_info *fi) {
 #endif
 
     //###TODO check fi->fh here...
-    fi->fh = get_local_fd(path);
+    try {
+        fi->fh = get_local_fd(path);
 
-    // remember flags and headers...
-    auto_lock lock(s3fs_descriptors_lock);
+        // remember flags and headers...
+        auto_lock lock(s3fs_descriptors_lock);
 
-    s3fs_descriptors[fi->fh] = fi->flags;
+        s3fs_descriptors[fi->fh] = fi->flags;
+    } catch (int e) {
+        return e;
+    }
 
     return 0;
 }
@@ -1518,11 +1474,12 @@ int s3fs_read(const char *path, char *buf,
         size_t size, off_t offset, struct fuse_file_info *fi)
 {
 #ifdef DEBUG
-    syslog(LOG_INFO, "read[%s] size[%u] offset[%llu]", path, size, offset);
+    syslog(LOG_INFO, "read[%s] size[%u] offset[%llu]",
+            path, (unsigned) size, (unsigned long long) offset);
 #endif
 
     int res = pread(fi->fh, buf, size, offset);
-    if (res == -1)
+    if (res < 0)
         Yikes(-errno);
     return res;
 }
@@ -1531,11 +1488,12 @@ int s3fs_write(const char *path, const char *buf,
         size_t size, off_t offset, struct fuse_file_info *fi)
 {
 #ifdef DEBUG
-    syslog(LOG_INFO, "write[%s] size[%u] offset[%llu]", path, size, offset);
+    syslog(LOG_INFO, "write[%s] size[%u] offset[%llu]",
+            path, (unsigned) size, (unsigned long long) offset);
 #endif
 
     int res = pwrite(fi->fh, buf, size, offset);
-    if (res == -1)
+    if (res < 0)
         Yikes(-errno);
     return res;
 }
@@ -1572,7 +1530,7 @@ int s3fs_flush(const char *path, struct fuse_file_info *fi) {
     if ((flags & O_RDWR) || (flags & O_WRONLY)) {
         try {
             Fileinfo info = get_fileinfo(path);
-            return generic_put(path, info.mode, fd);
+            return generic_put(path, info.mode, false, fd);
         } catch (int e) {
             return e;
         }
@@ -1588,7 +1546,7 @@ int s3fs_release(const char *path, struct fuse_file_info *fi) {
 #endif
 
     int fd = fi->fh;
-    if (close(fd) == -1)
+    if (close(fd) < 0)
         Yikes(-errno);
     return 0;
 }
@@ -1613,7 +1571,8 @@ int s3fs_readdir(const char *path, void *buf,
         fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi)
 {
 #ifdef DEBUG
-    syslog(LOG_INFO, "readdir[%s] offset[%llu]", path, offset);
+    syslog(LOG_INFO, "readdir[%s] offset[%llu]",
+            path, (unsigned long long) offset);
 #endif
 
     filler(buf, ".", 0, 0);
