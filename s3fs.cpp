@@ -272,6 +272,8 @@ public:
         curl_progress[curl_handle] = progress_t(-1, -1);
     }
     ~auto_curl() {
+        curl_times.erase(curl_handle);
+        curl_progress.erase(curl_handle);
         curl_easy_cleanup(curl_handle);
     }
     CURL* get() const {
