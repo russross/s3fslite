@@ -393,9 +393,9 @@ class Attrcache {
 
     public:
         Attrcache(const char *bucket);
-        Fileinfo get(const char *path);
+        Fileinfo *get(const char *path);
         void set(const char *path, struct stat *info, const char *etag);
-        void set(Fileinfo &info);
+        void set(Fileinfo *info);
         void del(const char *path);
         ~Attrcache();
 };
@@ -441,59 +441,56 @@ int get_headers(Transaction *t, const char *path, headers_t &head);
 int put_headers(Transaction *t, const char *path, headers_t head);
 int generic_put(Transaction *t, const char *path, mode_t mode,
         bool newfile, int fd = -1);
-void updateHeaders(Transaction *t, Fileinfo *info, const char *target = 0);
+void updateHeaders(Transaction *t, const char *target = 0);
 
-void updateHeaders(Transaction *t, Fileinfo *info, const char *target) {
+void updateHeaders(Transaction *t, const char *target) {
     // special case: for the root, just update the cache
-    if (info->path == "/") {
-        attrcache->set(*info);
+    if (t->info->path == "/") {
+        attrcache->set(t->info);
         return;
     }
 
     headers_t head;
-    head["x-amz-copy-source"] = urlEncode("/" + bucket + info->path);
-    head["x-amz-meta-uid"] = str(info->uid);
-    head["x-amz-meta-gid"] = str(info->gid);
-    head["x-amz-meta-mode"] = str(info->mode);
-    head["x-amz-meta-mtime"] = str(info->mtime);
-    head["Content-Length"] = str(info->size);
-    if (info->mode & S_IFDIR)
+    head["x-amz-copy-source"] = urlEncode("/" + bucket + t->info->path);
+    head["x-amz-meta-uid"] = str(t->info->uid);
+    head["x-amz-meta-gid"] = str(t->info->gid);
+    head["x-amz-meta-mode"] = str(t->info->mode);
+    head["x-amz-meta-mtime"] = str(t->info->mtime);
+    head["Content-Length"] = str(t->info->size);
+    if (t->info->mode & S_IFDIR)
         head["Content-Type"] = "application/x-directory";
-    else if (info->mode & S_IFREG)
-        head["Content-Type"] = lookupMimeType(info->path);
+    else if (t->info->mode & S_IFREG)
+        head["Content-Type"] = lookupMimeType(t->info->path);
     else
         head["Content-Type"] = DEFAULT_MIME_TYPE;
     head["x-amz-metadata-directive"] = "REPLACE";
 
-    attrcache->del(info->path.c_str());
+    attrcache->del(t->info->path.c_str());
 
-    int result = put_headers(t, target ? target : info->path.c_str(), head);
+    int result = put_headers(t, target ? target : t->info->path.c_str(), head);
     if (result != 0)
         throw result;
 
     // put the new name in the cache
     if (target)
-        info->path = target;
-    attrcache->set(*info);
+        t->info->path = target;
+    attrcache->set(t->info);
 }
 
-Fileinfo get_fileinfo(Transaction *t, const char *path) {
+void get_fileinfo(Transaction *t, const char *path) {
     // first check the cache
-    try {
-        Fileinfo result = attrcache->get(path);
-        return result;
-    } catch (int e) {
-        // cache miss
-    }
+    t->info = attrcache->get(path);
+    if (t->info)
+        return;
 
     // special case for /
     if (!strcmp(path, "/")) {
-        Fileinfo result(path, 0, 0, root_mode | S_IFDIR, time(NULL), 0,
+        t->info = new Fileinfo(path, 0, 0, root_mode | S_IFDIR, time(NULL), 0,
                 MD5_EMPTY);
 
         // we'll even store it in the cache so rsync can update it
-        attrcache->set(result);
-        return result;
+        attrcache->set(t->info);
+        return;
     }
 
     // do a header lookup
@@ -530,12 +527,10 @@ Fileinfo get_fileinfo(Transaction *t, const char *path) {
     unsigned gid = strtoul(head["x-amz-meta-gid"].c_str(), NULL, 10);
 
     string etag(trim(head["ETag"], "\""));
-    Fileinfo result(path, uid, gid, mode, mtime, size, etag.c_str());
+    t->info = new Fileinfo(path, uid, gid, mode, mtime, size, etag.c_str());
 
     // update the cache
-    attrcache->set(result);
-
-    return result;
+    attrcache->set(t->info);
 }
 
 //
@@ -590,7 +585,7 @@ Attrcache::~Attrcache() {
     pthread_mutex_destroy(&lock);
 }
 
-Fileinfo Attrcache::get(const char *path) {
+Fileinfo *Attrcache::get(const char *path) {
     char **data;
     int rows;
     int columns;
@@ -610,17 +605,17 @@ Fileinfo Attrcache::get(const char *path) {
     if (status != SQLITE_OK) {
         syslog(LOG_ERR, "sqlite error[%s]", err);
         sqlite3_free(err);
-        throw -1;
+        return NULL;
     }
 
     // no results?
     if (rows == 0) {
         sqlite3_free_table(data);
-        throw -1;
+        return NULL;
     }
 
     // get the data from the second row
-    Fileinfo result(
+    Fileinfo *result = new Fileinfo(
             path,
             strtoul(data[6], NULL, 10), // uid
             strtoul(data[7], NULL, 10), // gid
@@ -666,10 +661,10 @@ void Attrcache::set(const char *path, struct stat *info, const char *etag) {
     sqlite3_free(query);
 }
 
-void Attrcache::set(Fileinfo &info) {
+void Attrcache::set(Fileinfo *info) {
     struct stat attr;
-    info.toStat(&attr);
-    set(info.path.c_str(), &attr, info.etag.c_str());
+    info->toStat(&attr);
+    set(info->path.c_str(), &attr, info->etag.c_str());
 }
 
 void Attrcache::del(const char *path) {
@@ -971,7 +966,7 @@ int get_local_fd(Transaction *t, const char *path) {
     string resolved_path(use_cache + "/" + bucket);
     string cache_path(resolved_path + path);
 
-    Fileinfo info = get_fileinfo(t, path);
+    get_fileinfo(t, path);
 
     if (use_cache.size() > 0) {
         int fd = open(cache_path.c_str(), O_RDWR);
@@ -985,7 +980,7 @@ int get_local_fd(Transaction *t, const char *path) {
             } catch (int e) {
                 return e;
             }
-            string remoteMd5(trim(info.etag, "\""));
+            string remoteMd5(trim(t->info->etag, "\""));
 
             // md5 match?
             if (localMd5 == remoteMd5)
@@ -1002,7 +997,7 @@ int get_local_fd(Transaction *t, const char *path) {
     if (use_cache.size() > 0) {
         // assume creating dirs in the cache succeeds
         mkdirp(resolved_path + mydirname(path), 0777);
-        fd = open(cache_path.c_str(), O_CREAT|O_RDWR|O_TRUNC, info.mode);
+        fd = open(cache_path.c_str(), O_CREAT|O_RDWR|O_TRUNC, t->info->mode);
     } else {
         // always start from scratch when cache is turned off
         fd = fileno(tmpfile());
@@ -1012,7 +1007,7 @@ int get_local_fd(Transaction *t, const char *path) {
         Yikes(-errno);
 
     // zero-length files are easy to download
-    if (info.size == 0)
+    if (t->info->size == 0)
         return fd;
 
     // download the file
@@ -1116,8 +1111,8 @@ int s3fs_getattr(const char *path, struct stat *stbuf) {
     Transaction t;
 
     try {
-        Fileinfo info = get_fileinfo(&t, path);
-        info.toStat(stbuf);
+        get_fileinfo(&t, path);
+        t.info->toStat(stbuf);
         return 0;
     } catch (int e) {
         if (e == -ENOENT) {
@@ -1171,14 +1166,16 @@ int generic_put(Transaction *t, const char *path, mode_t mode,
     string resource = urlEncode("/" + bucket + path);
     string url = host + resource;
 
-    // start with generic stats for a new, empty file
-    Fileinfo info(path, getuid(), getgid(), mode, time(NULL), 0, MD5_EMPTY);
-
     // does this file have existing stats?
-    if (!newfile) {
+    if (newfile) {
+        // no, start with generic stats for a new, empty file
+        t->info = new Fileinfo(path, getuid(), getgid(), mode,
+                time(NULL), 0, MD5_EMPTY);
+    } else {
+        // yes, get them
         try {
-            info = get_fileinfo(t, path);
-            info.mode = mode;
+            get_fileinfo(t, path);
+            t->info->mode = mode;
         } catch (int e) {
             // if it does not exist, that is okay. other errors are a problem
             if (e != -ENOENT)
@@ -1192,8 +1189,8 @@ int generic_put(Transaction *t, const char *path, mode_t mode,
         if (fstat(fd, &st) < 0)
             return -errno;
 
-        // for now just grab the size
-        info.size = st.st_size;
+        // grab the size from the cached file
+        t->info->size = st.st_size;
     }
 
     t->curl_init();
@@ -1206,18 +1203,18 @@ int generic_put(Transaction *t, const char *path, mode_t mode,
     string md5sum;
     string responseText;
     FILE *f = NULL;
-    if (fd < 0 || info.size == 0) {
+    if (fd < 0 || t->info->size == 0) {
         // easy case--no contents
         curl_easy_setopt(t->curl, CURLOPT_INFILESIZE, 0); // Content-Length: 0
     } else {
         // set it up to upload from a file descriptor
         unsigned char *md = get_md5(fd);
-        info.etag = md5_to_string(md);
+        t->info->etag = md5_to_string(md);
         md5sum = base64_encode_md5(md);
         delete[] md;
 
         curl_easy_setopt(t->curl, CURLOPT_INFILESIZE_LARGE,
-                static_cast<curl_off_t>(info.size)); // Content-Length
+                static_cast<curl_off_t>(t->info->size)); // Content-Length
         curl_easy_setopt(t->curl, CURLOPT_WRITEDATA, &responseText);
         curl_easy_setopt(t->curl, CURLOPT_WRITEFUNCTION, writeCallback);
 
@@ -1246,20 +1243,20 @@ int generic_put(Transaction *t, const char *path, mode_t mode,
         t->curl_add_header("Content-MD5: " + md5sum);
     t->curl_add_header("Content-Type: " + contentType);
     // x-amz headers: (a) alphabetical order and (b) no spaces after colon
-    t->curl_add_header("x-amz-acl:" + getAcl(info.mode));
-    t->curl_add_header("x-amz-meta-gid:" + str(info.gid));
-    t->curl_add_header("x-amz-meta-mode:" + str(info.mode));
-    t->curl_add_header("x-amz-meta-mtime:" + str(info.mtime));
-    t->curl_add_header("x-amz-meta-uid:" + str(info.uid));
+    t->curl_add_header("x-amz-acl:" + getAcl(t->info->mode));
+    t->curl_add_header("x-amz-meta-gid:" + str(t->info->gid));
+    t->curl_add_header("x-amz-meta-mode:" + str(t->info->mode));
+    t->curl_add_header("x-amz-meta-mtime:" + str(t->info->mtime));
+    t->curl_add_header("x-amz-meta-uid:" + str(t->info->uid));
     t->curl_add_header("Authorization: AWS " + AWSAccessKeyId + ":" +
             calc_signature("PUT", md5sum, contentType, date, t->curl_headers,
                 resource));
     curl_easy_setopt(t->curl, CURLOPT_HTTPHEADER, t->curl_headers);
 
 #ifdef DEBUG
-    if (fd >= 0 && info.size > 0) {
+    if (fd >= 0 && t->info->size > 0) {
         syslog(LOG_INFO, "uploading[%s] size[%llu]", path,
-                (unsigned long long) info.size);
+                (unsigned long long) t->info->size);
     }
 #endif
 
@@ -1271,7 +1268,7 @@ int generic_put(Transaction *t, const char *path, mode_t mode,
     if (f)
         fclose(f);
 
-    attrcache->set(info);
+    attrcache->set(t->info);
 
     return 0;
 }
@@ -1382,13 +1379,13 @@ int s3fs_rename(const char *from, const char *to) {
     Transaction t;
 
     try {
-        Fileinfo info = get_fileinfo(&t, from);
+        get_fileinfo(&t, from);
 
         // no renaming directories (yet)
-        if (info.mode & S_IFDIR)
+        if (t.info->mode & S_IFDIR)
             return -ENOTSUP;
 
-        updateHeaders(&t, &info, to);
+        updateHeaders(&t, to);
 
         return generic_remove(&t, from);
     } catch (int e) {
@@ -1404,13 +1401,13 @@ int s3fs_link(const char *from, const char *to) {
     Transaction t;
 
     try {
-        Fileinfo info = get_fileinfo(&t, from);
+        get_fileinfo(&t, from);
 
         // no linking directories
-        if (info.mode & S_IFDIR)
+        if (t.info->mode & S_IFDIR)
             return -ENOTSUP;
 
-        updateHeaders(&t, &info, to);
+        updateHeaders(&t, to);
 
         return 0;
     } catch (int e) {
@@ -1426,15 +1423,15 @@ int s3fs_chmod(const char *path, mode_t mode) {
     Transaction t;
 
     try {
-        Fileinfo info = get_fileinfo(&t, path);
+        get_fileinfo(&t, path);
 
         // make sure we have a file type
         if (!(mode & S_IFMT))
-            mode |= (info.mode & S_IFMT);
+            mode |= (t.info->mode & S_IFMT);
 
-        info.mode = mode;
+        t.info->mode = mode;
 
-        updateHeaders(&t, &info);
+        updateHeaders(&t);
 
         return 0;
     } catch (int e) {
@@ -1450,15 +1447,15 @@ int s3fs_chown(const char *path, uid_t uid, gid_t gid) {
     Transaction t;
 
     try {
-        Fileinfo info = get_fileinfo(&t, path);
+        get_fileinfo(&t, path);
 
         // uid or gid < 0 indicates no change
         if ((int) uid >= 0)
-            info.uid = uid;
+            t.info->uid = uid;
         if ((int) gid >= 0)
-            info.gid = gid;
+            t.info->gid = gid;
 
-        updateHeaders(&t, &info);
+        updateHeaders(&t);
 
         return 0;
     } catch (int e) {
@@ -1481,8 +1478,8 @@ int s3fs_truncate(const char *path, off_t size) {
     // this is just like creating a new file of length zero,
     // but keeping the old attributes
     try {
-        Fileinfo info = get_fileinfo(&t, path);
-        return generic_put(&t, path, info.mode, false);
+        get_fileinfo(&t, path);
+        return generic_put(&t, path, t.info->mode, false);
     } catch (int e) {
         return e;
     }
@@ -1577,8 +1574,8 @@ int s3fs_flush(const char *path, struct fuse_file_info *fi) {
     // if it was opened with write permission, assume it has changed
     if ((flags & O_RDWR) || (flags & O_WRONLY)) {
         try {
-            Fileinfo info = get_fileinfo(&t, path);
-            return generic_put(&t, path, info.mode, false, fd);
+            get_fileinfo(&t, path);
+            return generic_put(&t, path, t.info->mode, false, fd);
         } catch (int e) {
             return e;
         }
@@ -1808,11 +1805,11 @@ int s3fs_utimens(const char *path, const struct timespec ts[2]) {
     Transaction t;
 
     try {
-        Fileinfo info = get_fileinfo(&t, path);
+        get_fileinfo(&t, path);
 
-        info.mtime = ts[1].tv_sec;
+        t.info->mtime = ts[1].tv_sec;
 
-        updateHeaders(&t, &info);
+        updateHeaders(&t);
 
         return 0;
     } catch (int e) {
