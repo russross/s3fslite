@@ -260,13 +260,6 @@ class auto_lock {
         }
 };
 
-stack<CURL *> curl_handles;
-pthread_mutex_t curl_handles_lock;
-
-typedef pair<double, double> progress_t;
-map<CURL *, time_t> curl_times;
-map<CURL *, progress_t> curl_progress;
-
 pthread_mutex_t *mutex_buf = NULL;
 
 // http headers
@@ -1751,7 +1744,6 @@ void *s3fs_init(struct fuse_conn_info *conn) {
     CRYPTO_set_locking_callback(locking_function);
     CRYPTO_set_id_callback(id_function);
     curl_global_init(CURL_GLOBAL_ALL);
-    pthread_mutex_init(&curl_handles_lock, NULL);
     pthread_mutex_init(&s3fs_descriptors_lock, NULL);
 
     string line;
@@ -1784,7 +1776,6 @@ void s3fs_destroy(void*) {
     free(mutex_buf);
     mutex_buf = NULL;
     curl_global_cleanup();
-    pthread_mutex_destroy(&curl_handles_lock);
     pthread_mutex_destroy(&s3fs_descriptors_lock);
 }
 
