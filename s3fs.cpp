@@ -99,6 +99,34 @@ int retries = 2;
 long connect_timeout = 2;
 time_t readwrite_timeout = 10;
 
+/**
+ * urlEncode a fuse path,
+ * taking into special consideration "/",
+ * otherwise regular urlEncode.
+ */
+
+const char *hexAlphabet = "0123456789ABCDEF";
+
+string urlEncode(const string &s) {
+    string result;
+    for (unsigned i = 0; i < s.length(); ++i) {
+        if (s[i] == '/') // Note- special case for fuse paths...
+            result += s[i];
+        else if (isalnum(s[i]))
+            result += s[i];
+        else if (s[i] == '.' || s[i] == '-' || s[i] == '*' || s[i] == '_')
+            result += s[i];
+        else if (s[i] == ' ')
+            result += '+';
+        else {
+            result += "%";
+            result += hexAlphabet[static_cast<unsigned char>(s[i]) / 16];
+            result += hexAlphabet[static_cast<unsigned char>(s[i]) % 16];
+        }
+    }
+    return result;
+}
+
 class auto_fd {
     private:
         int fd;
@@ -132,20 +160,25 @@ class Fileinfo {
 
 class Transaction {
     public:
-        Transaction();
+        Transaction(const char *path);
         ~Transaction();
-        void curl_init();
+        void curl_init(string query = "");
         void curl_add_header(const string &s);
+        void curl_sign_request(string method, string content_md5,
+                string content_type, string date);
 
+        const char *path;
         Fileinfo *info;
         CURL *curl;
         time_t curl_time;
         double curl_dlnow;
         double curl_ulnow;
         curl_slist *curl_headers;
+        string curl_resource;
 };
 
-Transaction::Transaction() {
+Transaction::Transaction(const char *path) {
+    this->path = path;
     info = NULL;
     curl = NULL;
     curl_headers = NULL;
@@ -188,8 +221,7 @@ int my_curl_progress(void *clientp, double dltotal,
     return 0;
 }
 
-
-void Transaction::curl_init() {
+void Transaction::curl_init(string query) {
     // if there is an old handle laying around, clean it up
     if (curl)
         curl_easy_cleanup(curl);
@@ -204,6 +236,21 @@ void Transaction::curl_init() {
             my_curl_progress);
     curl_easy_setopt(curl, CURLOPT_PROGRESSDATA, this);
 
+    string url;
+
+    // readdir requests need special treatment
+    if (query == "") {
+        curl_resource = urlEncode("/" + bucket + path);
+        url = host + curl_resource;
+    } else {
+        curl_resource = urlEncode("/" + bucket);
+        url = host + curl_resource + "?" + query;
+    }
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_FAILONERROR, true);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, true);
+
     // set up progress tracking
     curl_time = time(0);
     curl_dlnow = -1;
@@ -217,6 +264,44 @@ void Transaction::curl_init() {
 
 void Transaction::curl_add_header(const string &s) {
     curl_headers = curl_slist_append(curl_headers, s.c_str());
+}
+
+const EVP_MD *evp_md = EVP_sha1();
+string base64_encode(unsigned char *md, unsigned md_len);
+
+void Transaction::curl_sign_request(string method, string content_md5,
+        string content_type, string date)
+{
+    string StringToSign;
+    StringToSign += method + "\n";
+    StringToSign += content_md5 + "\n";
+    StringToSign += content_type + "\n";
+    StringToSign += date + "\n";
+    int count = 0;
+
+    curl_slist *headers = curl_headers;
+    while (headers) {
+        if (strncmp(headers->data, "x-amz", 5) == 0) {
+            count++;
+            StringToSign += headers->data;
+            StringToSign += '\n'; // linefeed
+        }
+        headers = headers->next;
+    }
+    StringToSign += curl_resource;
+
+    const void *key = AWSSecretAccessKey.data();
+    int key_len = AWSSecretAccessKey.size();
+    const unsigned char *d =
+        reinterpret_cast<const unsigned char *>(StringToSign.data());
+    int n = StringToSign.size();
+    unsigned int md_len;
+    unsigned char md[EVP_MAX_MD_SIZE];
+
+    HMAC(evp_md, key, key_len, d, n, md, &md_len);
+
+    string signature = base64_encode(md, md_len);
+    curl_add_header("Authorization: AWS " + AWSAccessKeyId + ":" + signature);
 }
 
 template<typename T>
@@ -264,33 +349,6 @@ pthread_mutex_t *mutex_buf = NULL;
 
 // http headers
 typedef map<string, string> headers_t;
-
-const char *hexAlphabet = "0123456789ABCDEF";
-
-/**
- * urlEncode a fuse path,
- * taking into special consideration "/",
- * otherwise regular urlEncode.
- */
-string urlEncode(const string &s) {
-    string result;
-    for (unsigned i = 0; i < s.length(); ++i) {
-        if (s[i] == '/') // Note- special case for fuse paths...
-            result += s[i];
-        else if (isalnum(s[i]))
-            result += s[i];
-        else if (s[i] == '.' || s[i] == '-' || s[i] == '*' || s[i] == '_')
-            result += s[i];
-        else if (s[i] == ' ')
-            result += '+';
-        else {
-            result += "%";
-            result += hexAlphabet[static_cast<unsigned char>(s[i]) / 16];
-            result += hexAlphabet[static_cast<unsigned char>(s[i]) % 16];
-        }
-    }
-    return result;
-}
 
 class case_insensitive_compare_func {
     public:
@@ -430,10 +488,9 @@ void Fileinfo::toStat(struct stat *info) {
         info->st_blocks = info->st_size / 512 + 1;
 }
 
-int get_headers(Transaction *t, const char *path, headers_t &head);
-int put_headers(Transaction *t, const char *path, headers_t head);
-int generic_put(Transaction *t, const char *path, mode_t mode,
-        bool newfile, int fd = -1);
+int get_headers(Transaction *t, headers_t &head);
+int put_headers(Transaction *t, headers_t head);
+int generic_put(Transaction *t, mode_t mode, bool newfile, int fd = -1);
 void updateHeaders(Transaction *t, const char *target = 0);
 
 void updateHeaders(Transaction *t, const char *target) {
@@ -460,26 +517,30 @@ void updateHeaders(Transaction *t, const char *target) {
 
     attrcache->del(t->info->path.c_str());
 
-    int result = put_headers(t, target ? target : t->info->path.c_str(), head);
+    // once headers are set up, change info over to the target name (if any)
+    if (target) {
+        t->path = target;
+        t->info->path = target;
+    }
+
+    int result = put_headers(t, head);
     if (result != 0)
         throw result;
 
     // put the new name in the cache
-    if (target)
-        t->info->path = target;
     attrcache->set(t->info);
 }
 
-void get_fileinfo(Transaction *t, const char *path) {
+void get_fileinfo(Transaction *t) {
     // first check the cache
-    t->info = attrcache->get(path);
+    t->info = attrcache->get(t->path);
     if (t->info)
         return;
 
     // special case for /
-    if (!strcmp(path, "/")) {
-        t->info = new Fileinfo(path, 0, 0, root_mode | S_IFDIR, time(NULL), 0,
-                MD5_EMPTY);
+    if (!strcmp(t->path, "/")) {
+        t->info = new Fileinfo(t->path, 0, 0,
+                root_mode | S_IFDIR, time(NULL), 0, MD5_EMPTY);
 
         // we'll even store it in the cache so rsync can update it
         attrcache->set(t->info);
@@ -489,7 +550,7 @@ void get_fileinfo(Transaction *t, const char *path) {
     // do a header lookup
     headers_t head;
 
-    int status = get_headers(t, path, head);
+    int status = get_headers(t, head);
 
     // if we could not get the headers, assume it does not exist
     if (status)
@@ -520,7 +581,7 @@ void get_fileinfo(Transaction *t, const char *path) {
     unsigned gid = strtoul(head["x-amz-meta-gid"].c_str(), NULL, 10);
 
     string etag(trim(head["ETag"], "\""));
-    t->info = new Fileinfo(path, uid, gid, mode, mtime, size, etag.c_str());
+    t->info = new Fileinfo(t->path, uid, gid, mode, mtime, size, etag.c_str());
 
     // update the cache
     attrcache->set(t->info);
@@ -698,8 +759,6 @@ class Filecache {
 
 };
 
-const EVP_MD *evp_md = EVP_sha1();
-
 /**
  * Returns the current date
  * in a format suitable for a HTTP request header.
@@ -719,37 +778,8 @@ string get_date() {
  * @param date e.g., get_date()
  * @param resource e.g., "/pub"
  */
-string calc_signature(string method, string content_md5, string content_type,
-        string date, curl_slist* headers, string resource)
-{
-    string Signature;
-    string StringToSign;
-    StringToSign += method + "\n";
-    StringToSign += content_md5 + "\n";
-    StringToSign += content_type + "\n";
-    StringToSign += date + "\n";
-    int count = 0;
 
-    while (headers) {
-        if (strncmp(headers->data, "x-amz", 5) == 0) {
-            count++;
-            StringToSign += headers->data;
-            StringToSign += 10; // linefeed
-        }
-        headers = headers->next;
-    }
-    StringToSign += resource;
-
-    const void *key = AWSSecretAccessKey.data();
-    int key_len = AWSSecretAccessKey.size();
-    const unsigned char *d =
-        reinterpret_cast<const unsigned char *>(StringToSign.data());
-    int n = StringToSign.size();
-    unsigned int md_len;
-    unsigned char md[EVP_MAX_MD_SIZE];
-
-    HMAC(evp_md, key, key_len, d, n, md, &md_len);
-
+string base64_encode(unsigned char *md, unsigned md_len) {
     BIO *b64 = BIO_new(BIO_f_base64());
     BIO *bmem = BIO_new(BIO_s_mem());
     b64 = BIO_push(b64, bmem);
@@ -760,12 +790,13 @@ string calc_signature(string method, string content_md5, string content_type,
     BUF_MEM *bptr;
     BIO_get_mem_ptr(b64, &bptr);
 
-    Signature.resize(bptr->length - 1);
-    memcpy(&Signature[0], bptr->data, bptr->length-1);
+    string result;
+    result.resize(bptr->length - 1);
+    memcpy(&result[0], bptr->data, bptr->length-1);
 
     BIO_free_all(b64);
 
-    return Signature;
+    return result;
 }
 
 // libcurl callback
@@ -833,18 +864,12 @@ int mkdirp(const string &path, mode_t mode) {
  * @return fuse return code
  * TODO return pair<int, headers_t>?!?
  */
-int get_headers(Transaction *t, const char *path, headers_t &head) {
+int get_headers(Transaction *t, headers_t &head) {
 #ifdef DEBUG
-    syslog(LOG_INFO, "get_headers[%s]", path);
+    syslog(LOG_INFO, "get_headers[%s]", t->path);
 #endif
 
-    string resource(urlEncode("/" + bucket + path));
-    string url(host + resource);
-
     t->curl_init();
-    curl_easy_setopt(t->curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(t->curl, CURLOPT_FAILONERROR, true);
-    curl_easy_setopt(t->curl, CURLOPT_FOLLOWLOCATION, true);
     curl_easy_setopt(t->curl, CURLOPT_NOBODY, true); // HEAD
     curl_easy_setopt(t->curl, CURLOPT_FILETIME, true); // Last-Modified
 
@@ -854,8 +879,7 @@ int get_headers(Transaction *t, const char *path, headers_t &head) {
 
     string date = get_date();
     t->curl_add_header("Date: " + date);
-    t->curl_add_header("Authorization: AWS " + AWSAccessKeyId + ":" +
-            calc_signature("HEAD", "", "", date, t->curl_headers, resource));
+    t->curl_sign_request("HEAD", "", "", date);
     curl_easy_setopt(t->curl, CURLOPT_HTTPHEADER, t->curl_headers);
 
     VERIFY(my_curl_easy_perform((t->curl)));
@@ -921,29 +945,6 @@ string md5_to_string(unsigned char *md) {
     return sum;
 }
 
-string base64_encode_md5(unsigned char *md) {
-    BIO *bmem, *b64;
-    BUF_MEM *bptr;
-
-    b64 = BIO_new(BIO_f_base64());
-    bmem = BIO_new(BIO_s_mem());
-    b64 = BIO_push(b64, bmem);
-    BIO_write(b64, md, MD5_DIGEST_LENGTH);
-
-    // (void) is to silence a warning
-    (void) BIO_flush(b64);
-    BIO_get_mem_ptr(b64, &bptr);
-
-    char out[MD5_DIGEST_LENGTH * 2];
-    memcpy(out, bptr->data, bptr->length-1);
-    out[bptr->length-1] = 0;
-
-    BIO_free_all(b64);
-
-    string result(out);
-    return result;
-}
-
 /**
  * get_local_fd
  *
@@ -951,15 +952,12 @@ string base64_encode_md5(unsigned char *md) {
  * Open the cached copy if available, otherwise download it
  * into the cache and return the result.
  */
-int get_local_fd(Transaction *t, const char *path) {
-    string resource(urlEncode("/" + bucket + path));
-    string url(host + resource);
-
-    string baseName = mybasename(path);
+int get_local_fd(Transaction *t) {
+    string baseName = mybasename(t->path);
     string resolved_path(use_cache + "/" + bucket);
-    string cache_path(resolved_path + path);
+    string cache_path(resolved_path + t->path);
 
-    get_fileinfo(t, path);
+    get_fileinfo(t);
 
     if (use_cache.size() > 0) {
         int fd = open(cache_path.c_str(), O_RDWR);
@@ -989,7 +987,7 @@ int get_local_fd(Transaction *t, const char *path) {
     int fd;
     if (use_cache.size() > 0) {
         // assume creating dirs in the cache succeeds
-        mkdirp(resolved_path + mydirname(path), 0777);
+        mkdirp(resolved_path + mydirname(t->path), 0777);
         fd = open(cache_path.c_str(), O_CREAT|O_RDWR|O_TRUNC, t->info->mode);
     } else {
         // always start from scratch when cache is turned off
@@ -1005,9 +1003,6 @@ int get_local_fd(Transaction *t, const char *path) {
 
     // download the file
     t->curl_init();
-    curl_easy_setopt(t->curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(t->curl, CURLOPT_FAILONERROR, true);
-    curl_easy_setopt(t->curl, CURLOPT_FOLLOWLOCATION, true);
 
     int dupfd = dup(fd);
     FILE *f = fdopen(dupfd, "w+");
@@ -1017,12 +1012,11 @@ int get_local_fd(Transaction *t, const char *path) {
 
     string date = get_date();
     t->curl_add_header("Date: "+date);
-    t->curl_add_header("Authorization: AWS " + AWSAccessKeyId + ":" +
-            calc_signature("GET", "", "", date, t->curl_headers, resource));
+    t->curl_sign_request("GET", "", "", date);
     curl_easy_setopt(t->curl, CURLOPT_HTTPHEADER, t->curl_headers);
 
 #ifdef DEBUG
-    syslog(LOG_INFO, "downloading[%s]", path);
+    syslog(LOG_INFO, "downloading[%s]", t->path);
 #endif
 
     VERIFY(my_curl_easy_perform(t->curl, f));
@@ -1038,18 +1032,12 @@ int get_local_fd(Transaction *t, const char *path) {
  * create or update s3 meta
  * @return fuse return code
  */
-int put_headers(Transaction *t, const char *path, headers_t head) {
+int put_headers(Transaction *t, headers_t head) {
 #ifdef DEBUG
-    syslog(LOG_INFO, "put_headers[%s]", path);
+    syslog(LOG_INFO, "put_headers[%s]", t->path);
 #endif
 
-    string resource = urlEncode("/" + bucket + path);
-    string url = host + resource;
-
     t->curl_init();
-    curl_easy_setopt(t->curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(t->curl, CURLOPT_FAILONERROR, true);
-    curl_easy_setopt(t->curl, CURLOPT_FOLLOWLOCATION, true);
 
     string responseText;
     curl_easy_setopt(t->curl, CURLOPT_WRITEDATA, &responseText);
@@ -1079,16 +1067,14 @@ int put_headers(Transaction *t, const char *path, headers_t head) {
             t->curl_add_header(key + ":" + value);
     }
 
-    t->curl_add_header("Authorization: AWS " + AWSAccessKeyId + ":" +
-            calc_signature("PUT", "", ContentType, date, t->curl_headers,
-                resource));
+    t->curl_sign_request("PUT", "", ContentType, date);
     curl_easy_setopt(t->curl, CURLOPT_HTTPHEADER, t->curl_headers);
 
     //###rewind(f);
 
 #ifdef DEBUG
     syslog(LOG_INFO, "copying[%s] -> [%s]",
-            head["x-amz-copy-source"].c_str(), path);
+            head["x-amz-copy-source"].c_str(), t->path);
 #endif
 
     VERIFY(my_curl_easy_perform(t->curl));
@@ -1101,10 +1087,10 @@ int s3fs_getattr(const char *path, struct stat *stbuf) {
     syslog(LOG_INFO, "getattr[%s]", path);
 #endif
 
-    Transaction t;
+    Transaction t(path);
 
     try {
-        get_fileinfo(&t, path);
+        get_fileinfo(&t);
         t.info->toStat(stbuf);
         return 0;
     } catch (int e) {
@@ -1124,7 +1110,7 @@ int s3fs_readlink(const char *path, char *buf, size_t size) {
     syslog(LOG_INFO, "readlink[%s]", path);
 #endif
 
-    Transaction t;
+    Transaction t(path);
 
     if (size == 0)
         return 0;
@@ -1132,7 +1118,7 @@ int s3fs_readlink(const char *path, char *buf, size_t size) {
     try {
         size--; // save room for null at the end
 
-        auto_fd fd(get_local_fd(&t, path));
+        auto_fd fd(get_local_fd(&t));
 
         struct stat st;
         if (fstat(fd.get(), &st) < 0)
@@ -1153,21 +1139,16 @@ int s3fs_readlink(const char *path, char *buf, size_t size) {
 }
 
 // create a new file/directory
-int generic_put(Transaction *t, const char *path, mode_t mode,
-        bool newfile, int fd)
-{
-    string resource = urlEncode("/" + bucket + path);
-    string url = host + resource;
-
+int generic_put(Transaction *t, mode_t mode, bool newfile, int fd) {
     // does this file have existing stats?
     if (newfile) {
         // no, start with generic stats for a new, empty file
-        t->info = new Fileinfo(path, getuid(), getgid(), mode,
+        t->info = new Fileinfo(t->path, getuid(), getgid(), mode,
                 time(NULL), 0, MD5_EMPTY);
     } else {
         // yes, get them
         try {
-            get_fileinfo(t, path);
+            get_fileinfo(t);
             t->info->mode = mode;
         } catch (int e) {
             // if it does not exist, that is okay. other errors are a problem
@@ -1187,9 +1168,6 @@ int generic_put(Transaction *t, const char *path, mode_t mode,
     }
 
     t->curl_init();
-    curl_easy_setopt(t->curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(t->curl, CURLOPT_FAILONERROR, true);
-    curl_easy_setopt(t->curl, CURLOPT_FOLLOWLOCATION, true);
     curl_easy_setopt(t->curl, CURLOPT_UPLOAD, true); // HTTP PUT
 
     // set it up to upload the file contents
@@ -1203,7 +1181,7 @@ int generic_put(Transaction *t, const char *path, mode_t mode,
         // set it up to upload from a file descriptor
         unsigned char *md = get_md5(fd);
         t->info->etag = md5_to_string(md);
-        md5sum = base64_encode_md5(md);
+        md5sum = base64_encode(md, MD5_DIGEST_LENGTH);
         delete[] md;
 
         curl_easy_setopt(t->curl, CURLOPT_INFILESIZE_LARGE,
@@ -1228,7 +1206,7 @@ int generic_put(Transaction *t, const char *path, mode_t mode,
     if (mode & S_IFDIR)
         contentType = "application/x-directory";
     else if (mode & S_IFREG)
-        contentType = lookupMimeType(path);
+        contentType = lookupMimeType(t->path);
 
     string date = get_date();
     t->curl_add_header("Date: " + date);
@@ -1241,19 +1219,17 @@ int generic_put(Transaction *t, const char *path, mode_t mode,
     t->curl_add_header("x-amz-meta-mode:" + str(t->info->mode));
     t->curl_add_header("x-amz-meta-mtime:" + str(t->info->mtime));
     t->curl_add_header("x-amz-meta-uid:" + str(t->info->uid));
-    t->curl_add_header("Authorization: AWS " + AWSAccessKeyId + ":" +
-            calc_signature("PUT", md5sum, contentType, date, t->curl_headers,
-                resource));
+    t->curl_sign_request("PUT", md5sum, contentType, date);
     curl_easy_setopt(t->curl, CURLOPT_HTTPHEADER, t->curl_headers);
 
 #ifdef DEBUG
     if (fd >= 0 && t->info->size > 0) {
-        syslog(LOG_INFO, "uploading[%s] size[%llu]", path,
+        syslog(LOG_INFO, "uploading[%s] size[%llu]", t->path,
                 (unsigned long long) t->info->size);
     }
 #endif
 
-    attrcache->del(path);
+    attrcache->del(t->path);
 
     VERIFY(my_curl_easy_perform(t->curl));
 
@@ -1271,13 +1247,13 @@ int s3fs_mknod(const char *path, mode_t mode, dev_t rdev) {
     syslog(LOG_INFO, "mknod[%s] mode[0%o]", path, mode);
 #endif
 
-    Transaction t;
+    Transaction t(path);
 
     // see man 2 mknod
     // If pathname already exists, or is a symbolic link,
     // this call fails with an EEXIST error.
 
-    return generic_put(&t, path, mode | S_IFREG, true);
+    return generic_put(&t, mode | S_IFREG, true);
 }
 
 int s3fs_mkdir(const char *path, mode_t mode) {
@@ -1285,35 +1261,28 @@ int s3fs_mkdir(const char *path, mode_t mode) {
     syslog(LOG_INFO, "mkdir[%s] mode[0%o]", path, mode);
 #endif
 
-    Transaction t;
+    Transaction t(path);
 
-    return generic_put(&t, path, mode | S_IFDIR, true);
+    return generic_put(&t, mode | S_IFDIR, true);
 }
 
-int generic_remove(Transaction *t, const char *path) {
-    attrcache->del(path);
+int generic_remove(Transaction *t) {
+    attrcache->del(t->path);
 
-    string resource = urlEncode("/" + bucket + path);
-    string url = host + resource;
-
-    string baseName = mybasename(path);
+    string baseName = mybasename(t->path);
     string resolved_path(use_cache + "/" + bucket);
-    string cache_path(resolved_path + path);
+    string cache_path(resolved_path + t->path);
 
     // delete the cache copy if it exists
     if (use_cache.size() > 0)
         unlink(cache_path.c_str());
 
     t->curl_init();
-    curl_easy_setopt(t->curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(t->curl, CURLOPT_FAILONERROR, true);
-    curl_easy_setopt(t->curl, CURLOPT_FOLLOWLOCATION, true);
     curl_easy_setopt(t->curl, CURLOPT_CUSTOMREQUEST, "DELETE");
 
     string date = get_date();
     t->curl_add_header("Date: " + date);
-    t->curl_add_header("Authorization: AWS " + AWSAccessKeyId + ":" +
-            calc_signature("DELETE", "", "", date, t->curl_headers, resource));
+    t->curl_sign_request("DELETE", "", "", date);
     curl_easy_setopt(t->curl, CURLOPT_HTTPHEADER, t->curl_headers);
 
     VERIFY(my_curl_easy_perform(t->curl));
@@ -1326,9 +1295,9 @@ int s3fs_unlink(const char *path) {
     syslog(LOG_INFO, "unlink[%s]", path);
 #endif
 
-    Transaction t;
+    Transaction t(path);
 
-    return generic_remove(&t, path);
+    return generic_remove(&t);
 }
 
 int s3fs_rmdir(const char *path) {
@@ -1336,9 +1305,10 @@ int s3fs_rmdir(const char *path) {
     syslog(LOG_INFO, "rmdir[%s]", path);
 #endif
 
-    Transaction t;
+    // TODO: make sure the directory is empty
+    Transaction t(path);
 
-    return generic_remove(&t, path);
+    return generic_remove(&t);
 }
 
 int s3fs_symlink(const char *from, const char *to) {
@@ -1346,7 +1316,7 @@ int s3fs_symlink(const char *from, const char *to) {
     syslog(LOG_INFO, "symlink[%s] -> [%s]", from, to);
 #endif
 
-    Transaction t;
+    Transaction t(to);
 
     // put the link target into a file
     FILE *fp = tmpfile();
@@ -1357,7 +1327,7 @@ int s3fs_symlink(const char *from, const char *to) {
         Yikes(-errno);
     }
 
-    int result = generic_put(&t, to, S_IFLNK, true, fd);
+    int result = generic_put(&t, S_IFLNK, true, fd);
 
     fclose(fp);
 
@@ -1369,10 +1339,10 @@ int s3fs_rename(const char *from, const char *to) {
     syslog(LOG_INFO, "rename[%s] -> [%s]", from, to);
 #endif
 
-    Transaction t;
+    Transaction t(from);
 
     try {
-        get_fileinfo(&t, from);
+        get_fileinfo(&t);
 
         // no renaming directories (yet)
         if (t.info->mode & S_IFDIR)
@@ -1380,7 +1350,8 @@ int s3fs_rename(const char *from, const char *to) {
 
         updateHeaders(&t, to);
 
-        return generic_remove(&t, from);
+        t.path = from;
+        return generic_remove(&t);
     } catch (int e) {
         return e;
     }
@@ -1391,10 +1362,10 @@ int s3fs_link(const char *from, const char *to) {
     syslog(LOG_INFO, "link[%s] -> [%s]", from, to);
 #endif
 
-    Transaction t;
+    Transaction t(from);
 
     try {
-        get_fileinfo(&t, from);
+        get_fileinfo(&t);
 
         // no linking directories
         if (t.info->mode & S_IFDIR)
@@ -1413,10 +1384,10 @@ int s3fs_chmod(const char *path, mode_t mode) {
     syslog(LOG_INFO, "chmod[%s] mode[0%o]", path, mode);
 #endif
 
-    Transaction t;
+    Transaction t(path);
 
     try {
-        get_fileinfo(&t, path);
+        get_fileinfo(&t);
 
         // make sure we have a file type
         if (!(mode & S_IFMT))
@@ -1437,10 +1408,10 @@ int s3fs_chown(const char *path, uid_t uid, gid_t gid) {
     syslog(LOG_INFO, "chown[%s] uid[%d] gid[%d]", path, uid, gid);
 #endif
 
-    Transaction t;
+    Transaction t(path);
 
     try {
-        get_fileinfo(&t, path);
+        get_fileinfo(&t);
 
         // uid or gid < 0 indicates no change
         if ((int) uid >= 0)
@@ -1462,7 +1433,7 @@ int s3fs_truncate(const char *path, off_t size) {
             (unsigned long long) size);
 #endif
 
-    Transaction t;
+    Transaction t(path);
 
     // TODO: support all sizes of truncates
     if (size != 0)
@@ -1471,8 +1442,8 @@ int s3fs_truncate(const char *path, off_t size) {
     // this is just like creating a new file of length zero,
     // but keeping the old attributes
     try {
-        get_fileinfo(&t, path);
-        return generic_put(&t, path, t.info->mode, false);
+        get_fileinfo(&t);
+        return generic_put(&t, t.info->mode, false);
     } catch (int e) {
         return e;
     }
@@ -1483,11 +1454,11 @@ int s3fs_open(const char *path, struct fuse_file_info *fi) {
     syslog(LOG_INFO, "open[%s] flags[0%o]", path, fi->flags);
 #endif
 
-    Transaction t;
+    Transaction t(path);
 
     //###TODO check fi->fh here...
     try {
-        fi->fh = get_local_fd(&t, path);
+        fi->fh = get_local_fd(&t);
 
         // remember flags and headers...
         auto_lock lock(s3fs_descriptors_lock);
@@ -1557,7 +1528,7 @@ int s3fs_flush(const char *path, struct fuse_file_info *fi) {
     syslog(LOG_INFO, "flush[%s]", path);
 #endif
 
-    Transaction t;
+    Transaction t(path);
 
     int fd = fi->fh;
 
@@ -1567,8 +1538,8 @@ int s3fs_flush(const char *path, struct fuse_file_info *fi) {
     // if it was opened with write permission, assume it has changed
     if ((flags & O_RDWR) || (flags & O_WRONLY)) {
         try {
-            get_fileinfo(&t, path);
-            return generic_put(&t, path, t.info->mode, false, fd);
+            get_fileinfo(&t);
+            return generic_put(&t, t.info->mode, false, fd);
         } catch (int e) {
             return e;
         }
@@ -1615,7 +1586,7 @@ int s3fs_readdir(const char *path, void *buf,
             path, (unsigned long long) offset);
 #endif
 
-    Transaction t;
+    Transaction t(path);
 
     filler(buf, ".", 0, 0);
     filler(buf, "..", 0, 0);
@@ -1625,7 +1596,6 @@ int s3fs_readdir(const char *path, void *buf,
 
     while (IsTruncated == "true") {
         string responseText;
-        string resource = urlEncode("/" + bucket); // this is what gets signed
         string query = "delimiter=/&prefix=";
 
         if (strcmp(path, "/") != 0)
@@ -1637,22 +1607,14 @@ int s3fs_readdir(const char *path, void *buf,
         query += "&max-keys=";
         query += MAX_KEYS_PER_DIR_REQUEST;
 
-        string url = host + resource + "?" + query;
-
         // read the next chunk of files using curl
-        t.curl_init();
-        curl_easy_setopt(t.curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(t.curl, CURLOPT_FAILONERROR, true);
-        curl_easy_setopt(t.curl, CURLOPT_FOLLOWLOCATION, true);
+        t.curl_init(query);
         curl_easy_setopt(t.curl, CURLOPT_WRITEDATA, &responseText);
         curl_easy_setopt(t.curl, CURLOPT_WRITEFUNCTION, writeCallback);
 
         string date = get_date();
         t.curl_add_header("Date: " + date);
-        t.curl_add_header("Authorization: AWS " + AWSAccessKeyId + ":" +
-                calc_signature("GET", "", "", date, t.curl_headers,
-                    resource));
-
+        t.curl_sign_request("GET", "", "", date);
         curl_easy_setopt(t.curl, CURLOPT_HTTPHEADER, t.curl_headers);
 
         VERIFY(my_curl_easy_perform(t.curl));
@@ -1793,10 +1755,10 @@ int s3fs_utimens(const char *path, const struct timespec ts[2]) {
     syslog(LOG_INFO, "utimens[%s] mtime[%ld]", path, ts[1].tv_sec);
 #endif
 
-    Transaction t;
+    Transaction t(path);
 
     try {
-        get_fileinfo(&t, path);
+        get_fileinfo(&t);
 
         t.info->mtime = ts[1].tv_sec;
 
