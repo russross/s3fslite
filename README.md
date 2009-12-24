@@ -30,8 +30,8 @@ This fork has the following changes:
 
 *   `readdir` requests do *not* send off file attribute requests.
     The original code effectively issues a `getattr` request to S3
-    for each file when directories are listed. The cache is not
-    consulted, but the results are put in the cache.
+    for each file when directories are listed. The cache was not
+    consulted, but the results were put in the cache.
 
     This behavior made listing directories ridiculously slow. It
     appears to have been an attempt to optimize (by priming the
@@ -55,6 +55,11 @@ This fork has the following changes:
 *   MD5 sums are computed for all uploads. S3 verifies the checksum
     on the received data, ensuring that no data was corrupted in
     transit (at least not during uploads).
+
+*   The `use_cache` option has been removed. An on-disk cache is not
+    currently supported. I intend to implement a different caching
+    strategy. For AFS-style caching (which is more-or-less what s3fs
+    uses), a seperate caching layer would be more appropriate.
 
 
 Quick start
@@ -115,7 +120,7 @@ You only need to create this once. Put this directory where
 Starting with an empty bucket (or one that you have used with other
 versions of s3fs already), mount it like this:
 
-    sudo s3fs <bucket> <mountpoint> -o attr_cache=/var/cache/s3fs -o use_cache=/tmp -o allow_other
+    sudo s3fs <bucket> <mountpoint> -o attr_cache=/var/cache/s3fs -o allow_other
 
 This mounts the file system with a file cache and allows all users
 of the local machine to use the mount.
@@ -136,7 +141,7 @@ Substituting your editor of choice for `vim`, do:
 
 and add a line of the form:
 
-    s3fs#<bucket> <mountpoint> fuse attr_cache=/var/cache/s3fs,use_cache=/tmp,allow_other 0 0
+    s3fs#<bucket> <mountpoint> fuse attr_cache=/var/cache/s3fs,allow_other 0 0
 
 With that in place, you can mount it using:
 
@@ -166,9 +171,6 @@ The complete list of supported options is:
 
 *   `retries=` specify the maximum number of times a failed/timed
     out request should be retried (default `2`)
-
-*   `use_cache=` specify the directory for (and enable) a file cache
-    (default no cache)
 
 *   `connect_timeout=` specify the timeout interval for request
     connections (default `2`)
@@ -240,10 +242,6 @@ couple of limitations:
     above) and make sure "`fuse`" kernel module is compiled and
     loadable since FUSE requires this kernel module and s3fs
     requires it as well.
-
-*   Moving/renaming/erasing files takes time since the whole file
-    needs to be accessed first. A workaround could be to use cache
-    support with the `-o use_cache` option.
 
 
 License:
