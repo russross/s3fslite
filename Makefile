@@ -1,3 +1,5 @@
+SOURCES=s3fs.cpp fileinfo.cpp attrcache.cpp s3request.cpp
+
 CPP=g++
 
 CPPFLAGS=-ggdb -Wall -Wextra -Wno-unused-parameter -Os \
@@ -14,8 +16,11 @@ LDFLAGS=$(shell pkg-config fuse --libs) \
 
 all:	s3fs
 
+s3fs:	$(SOURCES:.cpp=.o)
+	g++ -o s3fs $(SOURCES:.cpp=.o) $(CPPFLAGS) $(LDFLAGS)
+
 install: all
 	cp -f s3fs /usr/bin
 
 clean:
-	rm -f s3fs s3fs.o
+	rm -f s3fs *.o *.gch
