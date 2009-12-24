@@ -159,6 +159,19 @@ std::string get_date() {
     return buf;
 }
 
+int create_tempfile() {
+    char localname[32];
+    strcpy(localname, "/tmp/s3fs.XXXXXX");
+    int fd = mkstemp(localname);
+    if (fd < 0)
+        throw -errno;
+    if (unlink(localname) < 0) {
+        close(fd);
+        throw -errno;
+    }
+    return fd;
+}
+
 // note: returns a buffer that must be delete[]ed
 unsigned char *get_md5(int fd) {
     MD5_CTX c;
@@ -466,17 +479,7 @@ int S3request::get_file(std::string path, Fileinfo *info) {
     std::string date = get_date();
 
     // create a temporary local file
-    char localname[32];
-    strcpy(localname, "/tmp/s3fs.XXXXXX");
-    int fd = mkstemp(localname);
-    if (fd < 0)
-        throw -errno;
-
-    // delete it now so it will automatically be cleanup up when closed
-    if (unlink(localname) < 0) {
-        close(fd);
-        throw -errno;
-    }
+    int fd = create_tempfile();
 
     // zero-length files are easy to download
     if (info->size == 0)

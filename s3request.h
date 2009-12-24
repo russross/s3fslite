@@ -10,6 +10,8 @@
 #define MAX_KEYS_PER_DIR_REQUEST 200
 typedef std::vector<std::string> stringlist;
 
+int create_tempfile();
+
 #define failif(e) do { \
     int result = (e); \
     if (result != 0) \

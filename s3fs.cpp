@@ -283,6 +283,7 @@ int s3fs_release(const char *path, struct fuse_file_info *fi) {
     syslog(LOG_INFO, "release[%s]", path);
 #endif
 
+    // TODO: should not assume flush has been called
     try {
         int fd = fi->fh;
         if (close(fd) < 0)
@@ -291,6 +292,19 @@ int s3fs_release(const char *path, struct fuse_file_info *fi) {
         return 0;
     } catch (int e) {
         syslog(LOG_INFO, "release[%s]: %s", path, strerror(e));
+        return e;
+    }
+}
+
+int s3fs_fsync(const char *path, int datasync, struct fuse_file_info *fi) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "fsync[%s]", path);
+#endif
+
+    try {
+        return 0;
+    } catch (int e) {
+        syslog(LOG_INFO, "fsync[%s]: %s", path, strerror(e));
         return e;
     }
 }
@@ -427,15 +441,7 @@ int s3fs_symlink(const char *from, const char *to) {
         Transaction t(to, S_IFLNK);
 
         // create a temporary local file
-        char localname[32];
-        strcpy(localname, "/tmp/s3fs.XXXXXX");
-        t.fd = mkstemp(localname);
-        if (t.fd < 0)
-            throw -errno;
-
-        // delete it now so it will automatically be cleanup up when closed
-        if (unlink(localname) < 0)
-            throw -errno;
+        t.fd = create_tempfile();
 
         // put the link target into a file
         if (pwrite(t.fd, from, strlen(from), 0) < 0)
@@ -847,10 +853,10 @@ int main(int argc, char *argv[]) {
     s3fs_oper.statfs = s3fs_statfs;
     s3fs_oper.flush = s3fs_flush;
     s3fs_oper.release = s3fs_release;
+    s3fs_oper.fsync = s3fs_fsync;
     s3fs_oper.readdir = s3fs_readdir;
     s3fs_oper.init = s3fs_init;
     s3fs_oper.destroy = s3fs_destroy;
-    s3fs_oper.access = s3fs_access;
     s3fs_oper.utimens = s3fs_utimens;
 
     attrcache = new Attrcache(bucket, attr_cache);
