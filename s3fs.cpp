@@ -29,36 +29,20 @@
 #include <iostream>
 #include <map>
 #include <sstream>
-#include <stack>
 #include <string>
 #include <vector>
-#include <algorithm>
 
 // C and Unix libraries
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include <unistd.h>
-#include <fcntl.h>
-#include <dirent.h>
 #include <errno.h>
 #include <syslog.h>
 #include <time.h>
 #include <pthread.h>
-#include <libgen.h>
 
 // non-standard dependencies
-#include <libxml/parser.h>
-#include <libxml/tree.h>
-#include <curl/curl.h>
-#include <openssl/md5.h>
-#include <openssl/bio.h>
-#include <openssl/buffer.h>
-#include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <fuse.h>
-#include <sqlite3.h>
 
 // project dependencies
 #include "fileinfo.h"
@@ -72,7 +56,7 @@ using namespace std;
 string bucket;
 string AWSAccessKeyId;
 string AWSSecretAccessKey;
-string host = "http://s3.amazonaws.com";
+string host("http://s3.amazonaws.com");
 mode_t root_mode = 0755;
 string attr_cache;
 int retries = 2;
@@ -217,7 +201,6 @@ int s3fs_getattr(const char *path, struct stat *stbuf) {
 #ifdef DEBUG
     syslog(LOG_INFO, "getattr[%s]", path);
 #endif
-
 
     try {
         Transaction t(path);
@@ -368,9 +351,16 @@ int s3fs_rmdir(const char *path) {
     syslog(LOG_INFO, "rmdir[%s]", path);
 #endif
 
-    // TODO: make sure the directory is empty
     try {
         Transaction t(path);
+
+        // make sure the directory is empty
+        string marker;
+        stringlist entries;
+        S3request::get_directory(path, marker, entries, 1);
+        if (entries.size() > 0)
+            throw -ENOTEMPTY;
+
         generic_remove(&t);
 
         return 0;
