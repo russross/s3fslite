@@ -68,71 +68,31 @@
 
 using namespace std;
 
-#define VERIFY(s) do { \
-    int result = (s); \
-    if (result != 0) \
-        return result; \
-} while (0)
-
-#define Yikes(result) do { \
-    syslog(LOG_ERR, "yikes[%s] line[%u]", strerror(result), __LINE__); \
-    return result; \
-} while (0)
-
 // config parameters
 string bucket;
 string AWSAccessKeyId;
 string AWSSecretAccessKey;
 string host = "http://s3.amazonaws.com";
 mode_t root_mode = 0755;
-
 string attr_cache;
+int retries = 2;
+long connect_timeout = 2;
+time_t readwrite_timeout = 10;
 
 // private, public-read, public-read-write, authenticated-read
 string default_acl;
 string private_acl("private");
 string public_acl("public-read");
 
-// -oretries=2
-int retries = 2;
+Attrcache *attrcache;
 
-long connect_timeout = 2;
-time_t readwrite_timeout = 10;
+pthread_mutex_t *mutex_buf = NULL;
 
-class auto_fd {
-    private:
-        int fd;
-    public:
-        auto_fd(int fd): fd(fd) {}
-        ~auto_fd() {
-            close(fd);
-        }
-        int get() {
-            return fd;
-        }
-};
+mimes_t mimeTypes;
 
-class Transaction {
-    public:
-        Transaction(std::string path);
-        ~Transaction();
-
-        std::string path;
-        Fileinfo *info;
-};
-
-Transaction::Transaction(std::string path) {
-    this->path = path;
-    info = NULL;
-}
-
-Transaction::~Transaction() {
-    if (info) {
-        delete info;
-        info = NULL;
-    }
-}
-
+// fd -> flags
+map<int, int> s3fs_descriptors;
+pthread_mutex_t s3fs_descriptors_lock;
 static std::string SPACES(" \t\r\n");
 static std::string QUOTES("\"");
 
@@ -151,19 +111,62 @@ std::string trim_quotes(const std::string &s) {
         return "";
     return s.substr(start, end + 1 - start);
 }
-pthread_mutex_t *mutex_buf = NULL;
 
-mimes_t mimeTypes;
+int get_flags(int fd) {
+    auto_lock lock(s3fs_descriptors_lock);
+    return s3fs_descriptors[fd];
+}
 
-// fd -> flags
-map<int, int> s3fs_descriptors;
-pthread_mutex_t s3fs_descriptors_lock;
+class Transaction {
+    public:
+        Transaction(std::string path, mode_t mode = 0);
+        ~Transaction();
 
-Attrcache *attrcache;
+        std::string path;
+        Fileinfo *info;
+        int fd;
+};
 
-int generic_put(Transaction *t, mode_t mode, bool newfile, int fd = -1);
+Transaction::Transaction(std::string path, mode_t mode) {
+    this->path = path;
+    fd = -1;
 
-void copy_file(Transaction *t) {
+    // is this for a new or existing file?
+    if (mode) {
+        info = new Fileinfo(path, getuid(), getgid(),
+                mode, time(NULL), 0, MD5_EMPTY);
+    } else {
+        // first check the cache
+        info = attrcache->get(path);
+        if (info)
+            return;
+
+        // special case for /
+        if (path == "/") {
+            info = new Fileinfo(path, getuid(), getgid(),
+                    root_mode | S_IFDIR, time(NULL), 0, MD5_EMPTY);
+        } else {
+            info = S3request::get_fileinfo(path);
+        }
+
+        // update the cache
+        // the fake "/" entry is cached, too, so that rsync can update it
+        attrcache->set(info);
+    }
+}
+
+Transaction::~Transaction() {
+    delete info;
+    info = NULL;
+
+    if (fd >= 0) {
+        close(fd);
+        fd = -1;
+    }
+}
+
+// copy a file, possibly onto itself (to update headers)
+void generic_copy_file(Transaction *t) {
     // special case: for the root, just update the cache
     if (t->path == "/") {
         attrcache->del(t->path);
@@ -179,76 +182,52 @@ void copy_file(Transaction *t) {
     attrcache->set(t->info);
 }
 
-void get_fileinfo(Transaction *t) {
-    // first check the cache
-    t->info = attrcache->get(t->path);
-    if (t->info)
-        return;
+// create a new file/directory
+void generic_put(Transaction *t, int fd = -1) {
+    // does this file have contents to be transmitted?
+    if (fd >= 0) {
+        struct stat st;
+        if (fstat(fd, &st) < 0)
+            throw -errno;
 
-    // special case for /
-    if (t->path == "/") {
-        t->info = new Fileinfo(t->path, 0, 0,
-                root_mode | S_IFDIR, time(NULL), 0, MD5_EMPTY);
-    } else {
-        t->info = S3request::get_fileinfo(t->path);
+        // grab the size from the cached file
+        t->info->size = st.st_size;
     }
 
-    // update the cache
-    // the fake "/" entry is cached, too, so that rsync can update it
+    attrcache->del(t->path);
+    S3request::put_file(t->info, fd);
     attrcache->set(t->info);
 }
 
-// safe variant of dirname
-string mydirname(string path) {
-    // dirname clobbers path so let it operate on a tmp copy
-    return dirname(&path[0]);
+// remove a file or directory
+void generic_remove(Transaction *t) {
+    attrcache->del(t->path);
+    S3request::remove(t->path);
 }
 
-// safe variant of basename
-string mybasename(string path) {
-    // basename clobbers path so let it operate on a tmp copy
-    return basename(&path[0]);
-}
 
-// mkdir --parents
-int mkdirp(const string &path, mode_t mode) {
-    string base;
-    string component;
-    stringstream ss(path);
-    while (getline(ss, component, '/')) {
-        base += "/" + component;
-        /*if (*/mkdir(base.c_str(), mode)/* == -1);
-            return -1*/;
-    }
-    return 0;
-}
+//
+//
+// VFS calls
+//
+//
 
-/**
- * get_local_fd
- *
- * Return the fd for a local copy of the given path.
- * Open the cached copy if available, otherwise download it
- * into the cache and return the result.
- */
-int get_local_fd(Transaction *t) {
-    get_fileinfo(t);
-
-    return S3request::get_file(t->path, t->info);
-}
 
 int s3fs_getattr(const char *path, struct stat *stbuf) {
 #ifdef DEBUG
     syslog(LOG_INFO, "getattr[%s]", path);
 #endif
 
-    Transaction t(path);
 
     try {
-        get_fileinfo(&t);
+        Transaction t(path);
         t.info->toStat(stbuf);
+
         return 0;
     } catch (int e) {
         if (e == -ENOENT) {
+            // getattr is used to check if a file exists, so
+            // getting a File Not Found error is nothing to worry about
 #ifdef DEBUG
             syslog(LOG_INFO, "getattr[%s]: File not found", path);
 #endif
@@ -259,268 +238,13 @@ int s3fs_getattr(const char *path, struct stat *stbuf) {
     }
 }
 
-int s3fs_readlink(const char *path, char *buf, size_t size) {
+int s3fs_access(const char *path, int mask) {
 #ifdef DEBUG
-    syslog(LOG_INFO, "readlink[%s]", path);
+    syslog(LOG_INFO, "access[%s] mask[0%o]", path, mask);
 #endif
 
-    Transaction t(path);
-
-    if (size == 0)
-        return 0;
-
-    try {
-        size--; // save room for null at the end
-
-        auto_fd fd(get_local_fd(&t));
-
-        struct stat st;
-        if (fstat(fd.get(), &st) < 0)
-            Yikes(-errno);
-
-        if ((size_t) st.st_size < size)
-            size = st.st_size;
-
-        if (pread(fd.get(), buf, size, 0) < 0)
-            Yikes(-errno);
-
-        buf[size] = 0;
-    } catch (int e) {
-        return e;
-    }
-
+    // let anyone do anything
     return 0;
-}
-
-// create a new file/directory
-int generic_put(Transaction *t, mode_t mode, bool newfile, int fd) {
-    // does this file have existing stats?
-    if (newfile) {
-        // no, start with generic stats for a new, empty file
-        t->info = new Fileinfo(t->path, getuid(), getgid(), mode,
-                time(NULL), 0, MD5_EMPTY);
-    } else {
-        // yes, get them
-        try {
-            get_fileinfo(t);
-            t->info->mode = mode;
-        } catch (int e) {
-            // if it does not exist, that is okay. other errors are a problem
-            if (e != -ENOENT)
-                throw e;
-        }
-    }
-
-    // does this file have contents to be transmitted?
-    if (fd >= 0) {
-        struct stat st;
-        if (fstat(fd, &st) < 0)
-            return -errno;
-
-        // grab the size from the cached file
-        t->info->size = st.st_size;
-    }
-
-    attrcache->del(t->path);
-
-    S3request::put_file(t->info, fd);
-
-    attrcache->set(t->info);
-
-    return 0;
-}
-
-int s3fs_mknod(const char *path, mode_t mode, dev_t rdev) {
-#ifdef DEBUG
-    syslog(LOG_INFO, "mknod[%s] mode[0%o]", path, mode);
-#endif
-
-    Transaction t(path);
-
-    // see man 2 mknod
-    // If pathname already exists, or is a symbolic link,
-    // this call fails with an EEXIST error.
-
-    return generic_put(&t, mode | S_IFREG, true);
-}
-
-int s3fs_mkdir(const char *path, mode_t mode) {
-#ifdef DEBUG
-    syslog(LOG_INFO, "mkdir[%s] mode[0%o]", path, mode);
-#endif
-
-    Transaction t(path);
-
-    return generic_put(&t, mode | S_IFDIR, true);
-}
-
-int generic_remove(Transaction *t) {
-    attrcache->del(t->path);
-
-    S3request::remove(t->path);
-    return 0;
-}
-
-int s3fs_unlink(const char *path) {
-#ifdef DEBUG
-    syslog(LOG_INFO, "unlink[%s]", path);
-#endif
-
-    Transaction t(path);
-
-    return generic_remove(&t);
-}
-
-int s3fs_rmdir(const char *path) {
-#ifdef DEBUG
-    syslog(LOG_INFO, "rmdir[%s]", path);
-#endif
-
-    // TODO: make sure the directory is empty
-    Transaction t(path);
-
-    return generic_remove(&t);
-}
-
-int s3fs_symlink(const char *from, const char *to) {
-#ifdef DEBUG
-    syslog(LOG_INFO, "symlink[%s] -> [%s]", from, to);
-#endif
-
-    Transaction t(to);
-
-    // put the link target into a file
-    FILE *fp = tmpfile();
-    int fd = fileno(fp);
-
-    if (pwrite(fd, from, strlen(from), 0) < 0) {
-        fclose(fp);
-        Yikes(-errno);
-    }
-
-    int result = generic_put(&t, S_IFLNK, true, fd);
-
-    fclose(fp);
-
-    return result;
-}
-
-int s3fs_rename(const char *from, const char *to) {
-#ifdef DEBUG
-    syslog(LOG_INFO, "rename[%s] -> [%s]", from, to);
-#endif
-
-    Transaction t(from);
-
-    try {
-        get_fileinfo(&t);
-
-        // no renaming directories (yet)
-        if (t.info->mode & S_IFDIR)
-            return -ENOTSUP;
-
-        t.info->path = to;
-        copy_file(&t);
-
-        t.path = from;
-        t.info->path = from;
-        return generic_remove(&t);
-    } catch (int e) {
-        return e;
-    }
-}
-
-int s3fs_link(const char *from, const char *to) {
-#ifdef DEBUG
-    syslog(LOG_INFO, "link[%s] -> [%s]", from, to);
-#endif
-
-    Transaction t(from);
-
-    try {
-        get_fileinfo(&t);
-
-        // no linking directories
-        if (t.info->mode & S_IFDIR)
-            return -ENOTSUP;
-
-        t.info->path = to;
-        copy_file(&t);
-
-        return 0;
-    } catch (int e) {
-        return e;
-    }
-}
-
-int s3fs_chmod(const char *path, mode_t mode) {
-#ifdef DEBUG
-    syslog(LOG_INFO, "chmod[%s] mode[0%o]", path, mode);
-#endif
-
-    Transaction t(path);
-
-    try {
-        get_fileinfo(&t);
-
-        // make sure we have a file type
-        if (!(mode & S_IFMT))
-            mode |= (t.info->mode & S_IFMT);
-
-        t.info->mode = mode;
-
-        copy_file(&t);
-
-        return 0;
-    } catch (int e) {
-        return e;
-    }
-}
-
-int s3fs_chown(const char *path, uid_t uid, gid_t gid) {
-#ifdef DEBUG
-    syslog(LOG_INFO, "chown[%s] uid[%d] gid[%d]", path, uid, gid);
-#endif
-
-    Transaction t(path);
-
-    try {
-        get_fileinfo(&t);
-
-        // uid or gid < 0 indicates no change
-        if ((int) uid >= 0)
-            t.info->uid = uid;
-        if ((int) gid >= 0)
-            t.info->gid = gid;
-
-        copy_file(&t);
-
-        return 0;
-    } catch (int e) {
-        return e;
-    }
-}
-
-int s3fs_truncate(const char *path, off_t size) {
-#ifdef DEBUG
-    syslog(LOG_INFO, "truncate[%s] size[%llu]", path,
-            (unsigned long long) size);
-#endif
-
-    Transaction t(path);
-
-    // TODO: support all sizes of truncates
-    if (size != 0)
-        return -ENOTSUP;
-
-    // this is just like creating a new file of length zero,
-    // but keeping the old attributes
-    try {
-        get_fileinfo(&t);
-        return generic_put(&t, t.info->mode, false);
-    } catch (int e) {
-        return e;
-    }
 }
 
 int s3fs_open(const char *path, struct fuse_file_info *fi) {
@@ -530,19 +254,331 @@ int s3fs_open(const char *path, struct fuse_file_info *fi) {
 
     Transaction t(path);
 
-    //###TODO check fi->fh here...
+    // TODO: see if this file is already open
     try {
-        fi->fh = get_local_fd(&t);
+        fi->fh = S3request::get_file(t.path, t.info);
 
         // remember flags and headers...
         auto_lock lock(s3fs_descriptors_lock);
 
         s3fs_descriptors[fi->fh] = fi->flags;
+
+        return 0;
     } catch (int e) {
+        syslog(LOG_INFO, "open[%s]: %s", path, strerror(e));
         return e;
     }
+}
 
-    return 0;
+int s3fs_flush(const char *path, struct fuse_file_info *fi) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "flush[%s]", path);
+#endif
+
+    try {
+        Transaction t(path);
+
+        int fd = fi->fh;
+
+        // fi->flags is not available here
+        int flags = get_flags(fd);
+
+        // if it was opened with write permission, assume it has changed
+        // TODO: track if file was actually changed
+        if ((flags & O_RDWR) || (flags & O_WRONLY))
+            generic_put(&t, fd);
+
+        return 0;
+    } catch (int e) {
+        syslog(LOG_INFO, "flush[%s]: %s", path, strerror(e));
+        return e;
+    }
+}
+
+int s3fs_release(const char *path, struct fuse_file_info *fi) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "release[%s]", path);
+#endif
+
+    try {
+        int fd = fi->fh;
+        if (close(fd) < 0)
+            throw -errno;
+
+        return 0;
+    } catch (int e) {
+        syslog(LOG_INFO, "release[%s]: %s", path, strerror(e));
+        return e;
+    }
+}
+
+int s3fs_mknod(const char *path, mode_t mode, dev_t rdev) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "mknod[%s] mode[0%o]", path, mode);
+#endif
+
+    // see man 2 mknod
+    // If pathname already exists, or is a symbolic link,
+    // this call fails with an EEXIST error.
+    try {
+        Transaction t(path, mode | S_IFREG);
+        generic_put(&t);
+
+        return 0;
+    } catch (int e) {
+        syslog(LOG_INFO, "mknod[%s]: %s", path, strerror(e));
+        return e;
+    }
+}
+
+int s3fs_mkdir(const char *path, mode_t mode) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "mkdir[%s] mode[0%o]", path, mode);
+#endif
+
+    try {
+        Transaction t(path, mode | S_IFDIR);
+        generic_put(&t);
+
+        return 0;
+    } catch (int e) {
+        syslog(LOG_INFO, "mkdir[%s]: %s", path, strerror(e));
+        return e;
+    }
+}
+
+int s3fs_unlink(const char *path) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "unlink[%s]", path);
+#endif
+
+    try {
+        Transaction t(path);
+        generic_remove(&t);
+
+        return 0;
+    } catch (int e) {
+        syslog(LOG_INFO, "unlink[%s]: %s", path, strerror(e));
+        return e;
+    }
+}
+
+int s3fs_rmdir(const char *path) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "rmdir[%s]", path);
+#endif
+
+    // TODO: make sure the directory is empty
+    try {
+        Transaction t(path);
+        generic_remove(&t);
+
+        return 0;
+    } catch (int e) {
+        syslog(LOG_INFO, "rmdir[%s]: %s", path, strerror(e));
+        return e;
+    }
+}
+
+int s3fs_rename(const char *from, const char *to) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "rename[%s] -> [%s]", from, to);
+#endif
+
+    try {
+        Transaction t(from);
+
+        // no renaming directories (yet)
+        if (t.info->mode & S_IFDIR)
+            throw -ENOTSUP;
+
+        t.info->path = to;
+        generic_copy_file(&t);
+
+        t.path = from;
+        t.info->path = from;
+        generic_remove(&t);
+
+        return 0;
+    } catch (int e) {
+        syslog(LOG_INFO, "rename[%s] -> [%s]: %s", from, to, strerror(e));
+        return e;
+    }
+}
+
+int s3fs_link(const char *from, const char *to) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "link[%s] -> [%s]", from, to);
+#endif
+
+    try {
+        Transaction t(from);
+
+        // no linking directories
+        if (t.info->mode & S_IFDIR)
+            throw -ENOTSUP;
+
+        t.info->path = to;
+        generic_copy_file(&t);
+
+        return 0;
+    } catch (int e) {
+        syslog(LOG_INFO, "link[%s] -> [%s]: %s", to, from, strerror(e));
+        return e;
+    }
+}
+
+int s3fs_symlink(const char *from, const char *to) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "symlink[%s] -> [%s]", to, from);
+#endif
+
+    try {
+        Transaction t(to, S_IFLNK);
+
+        // create a temporary local file
+        char localname[32];
+        strcpy(localname, "/tmp/s3fs.XXXXXX");
+        t.fd = mkstemp(localname);
+        if (t.fd < 0)
+            throw -errno;
+
+        // delete it now so it will automatically be cleanup up when closed
+        if (unlink(localname) < 0)
+            throw -errno;
+
+        // put the link target into a file
+        if (pwrite(t.fd, from, strlen(from), 0) < 0)
+            throw -errno;
+
+        generic_put(&t, t.fd);
+
+        return 0;
+    } catch (int e) {
+        syslog(LOG_INFO, "symlink[%s] -> [%s]: %s", to, from, strerror(e));
+        return e;
+    }
+}
+
+int s3fs_readlink(const char *path, char *buf, size_t size) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "readlink[%s]", path);
+#endif
+
+    // save room for null at the end
+    size--;
+    if (size <= 0)
+        return 0;
+
+    try {
+        Transaction t(path);
+        t.fd = S3request::get_file(t.path, t.info);
+
+        struct stat st;
+        if (fstat(t.fd, &st) < 0)
+            throw -errno;
+
+        if ((size_t) st.st_size < size)
+            size = st.st_size;
+
+        if (pread(t.fd, buf, size, 0) < 0)
+            throw -errno;
+
+        buf[size] = 0;
+
+        return 0;
+    } catch (int e) {
+        syslog(LOG_INFO, "readlink[%s]: %s", path, strerror(e));
+        return e;
+    }
+}
+
+int s3fs_chmod(const char *path, mode_t mode) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "chmod[%s] mode[0%o]", path, mode);
+#endif
+
+    try {
+        Transaction t(path);
+
+        // make sure we have a file type
+        if (!(mode & S_IFMT))
+            mode |= (t.info->mode & S_IFMT);
+
+        t.info->mode = mode;
+        generic_copy_file(&t);
+
+        return 0;
+    } catch (int e) {
+        syslog(LOG_INFO, "chmod[%s]: %s", path, strerror(e));
+        return e;
+    }
+}
+
+int s3fs_chown(const char *path, uid_t uid, gid_t gid) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "chown[%s] uid[%d] gid[%d]", path, uid, gid);
+#endif
+
+    try {
+        Transaction t(path);
+
+        // uid or gid < 0 indicates no change
+        if ((int) uid >= 0)
+            t.info->uid = uid;
+        if ((int) gid >= 0)
+            t.info->gid = gid;
+
+        generic_copy_file(&t);
+
+        return 0;
+    } catch (int e) {
+        syslog(LOG_INFO, "chown[%s]: %s", path, strerror(e));
+        return e;
+    }
+}
+
+int s3fs_utimens(const char *path, const struct timespec ts[2]) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "utimens[%s] mtime[%ld]", path, ts[1].tv_sec);
+#endif
+
+    try {
+        Transaction t(path);
+
+        t.info->mtime = ts[1].tv_sec;
+        generic_copy_file(&t);
+
+        return 0;
+    } catch (int e) {
+        syslog(LOG_INFO, "utimens[%s]: %s", path, strerror(e));
+        return e;
+    }
+}
+
+
+int s3fs_truncate(const char *path, off_t size) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "truncate[%s] size[%llu]", path,
+            (unsigned long long) size);
+#endif
+
+    try {
+        Transaction t(path);
+
+        // TODO: support all sizes of truncates
+        if (size != 0)
+            throw -ENOTSUP;
+
+        // this is just like creating a new file of length zero,
+        // but keeping the old attributes
+        generic_put(&t);
+
+        return 0;
+    } catch (int e) {
+        syslog(LOG_INFO, "truncate[%s]: %s", path, strerror(e));
+        return e;
+    }
 }
 
 int s3fs_read(const char *path, char *buf,
@@ -553,12 +589,16 @@ int s3fs_read(const char *path, char *buf,
             path, (unsigned) size, (unsigned long long) offset);
 #endif
 
-    //Transaction t;
+    try {
+        int res = pread(fi->fh, buf, size, offset);
+        if (res < 0)
+            throw -errno;
 
-    int res = pread(fi->fh, buf, size, offset);
-    if (res < 0)
-        Yikes(-errno);
-    return res;
+        return res;
+    } catch (int e) {
+        syslog(LOG_INFO, "read[%s]: %s", path, strerror(e));
+        return e;
+    }
 }
 
 int s3fs_write(const char *path, const char *buf,
@@ -569,87 +609,16 @@ int s3fs_write(const char *path, const char *buf,
             path, (unsigned) size, (unsigned long long) offset);
 #endif
 
-    //Transaction t;
+    try {
+        int res = pwrite(fi->fh, buf, size, offset);
+        if (res < 0)
+            throw -errno;
 
-    int res = pwrite(fi->fh, buf, size, offset);
-    if (res < 0)
-        Yikes(-errno);
-    return res;
-}
-
-int s3fs_statfs(const char *path, struct statvfs *stbuf) {
-#ifdef DEBUG
-    syslog(LOG_INFO, "statfs[%s]", path);
-#endif
-
-    //Transaction t;
-
-    // 256T
-    stbuf->f_bsize = 0X1000000;
-    stbuf->f_blocks = 0X1000000;
-    stbuf->f_bfree = 0x1000000;
-    stbuf->f_bavail = 0x1000000;
-    return 0;
-}
-
-int get_flags(int fd) {
-    auto_lock lock(s3fs_descriptors_lock);
-    return s3fs_descriptors[fd];
-}
-
-int s3fs_flush(const char *path, struct fuse_file_info *fi) {
-#ifdef DEBUG
-    syslog(LOG_INFO, "flush[%s]", path);
-#endif
-
-    Transaction t(path);
-
-    int fd = fi->fh;
-
-    // fi->flags is not available here
-    int flags = get_flags(fd);
-
-    // if it was opened with write permission, assume it has changed
-    if ((flags & O_RDWR) || (flags & O_WRONLY)) {
-        try {
-            get_fileinfo(&t);
-            return generic_put(&t, t.info->mode, false, fd);
-        } catch (int e) {
-            return e;
-        }
+        return res;
+    } catch (int e) {
+        syslog(LOG_INFO, "write[%s]: %s", path, strerror(e));
+        return e;
     }
-
-    // nothing to do
-    return 0;
-}
-
-int s3fs_release(const char *path, struct fuse_file_info *fi) {
-#ifdef DEBUG
-    syslog(LOG_INFO, "release[%s]", path);
-#endif
-
-    //Transaction t;
-
-    int fd = fi->fh;
-    if (close(fd) < 0)
-        Yikes(-errno);
-    return 0;
-}
-
-time_t my_timegm(struct tm *tm) {
-    time_t ret;
-    char *tz;
-
-    tz = getenv("TZ");
-    setenv("TZ", "", 1);
-    tzset();
-    ret = mktime(tm);
-    if (tz)
-        setenv("TZ", tz, 1);
-    else
-        unsetenv("TZ");
-    tzset();
-    return ret;
 }
 
 int s3fs_readdir(const char *path, void *buf,
@@ -660,27 +629,30 @@ int s3fs_readdir(const char *path, void *buf,
             path, (unsigned long long) offset);
 #endif
 
-    //Transaction t(path);
+    try {
+        filler(buf, ".", 0, 0);
+        filler(buf, "..", 0, 0);
 
-    filler(buf, ".", 0, 0);
-    filler(buf, "..", 0, 0);
+        string marker;
+        int moretocome = 1;
 
-    string marker;
-    int moretocome = 1;
+        while (moretocome) {
+            stringlist entries;
+            moretocome = S3request::get_directory(path, marker, entries);
 
-    while (moretocome) {
-        stringlist entries;
-        moretocome = S3request::get_directory(path, marker, entries);
-
-        for (size_t i = 0; i < entries.size(); i++) {
-            if (filler(buf, entries[i].c_str(), 0, 0)) {
-                syslog(LOG_ERR, "readdir: buffer full");
-                break;
+            for (size_t i = 0; i < entries.size(); i++) {
+                if (filler(buf, entries[i].c_str(), 0, 0)) {
+                    syslog(LOG_ERR, "readdir: buffer full");
+                    break;
+                }
             }
         }
-    }
 
-    return 0;
+        return 0;
+    } catch (int e) {
+        syslog(LOG_INFO, "readdir[%s]: %s", path, strerror(e));
+        return e;
+    }
 }
 
 /**
@@ -741,6 +713,21 @@ void *s3fs_init(struct fuse_conn_info *conn) {
     return 0;
 }
 
+int s3fs_statfs(const char *path, struct statvfs *stbuf) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "statfs[%s]", path);
+#endif
+
+    // 256T
+    stbuf->f_bsize = 0X1000000;
+    stbuf->f_blocks = 0X1000000;
+    stbuf->f_bfree = 0x1000000;
+    stbuf->f_bavail = 0x1000000;
+
+    return 0;
+}
+
+
 void s3fs_destroy(void*) {
     syslog(LOG_INFO, "destroy[%s]", bucket.c_str());
 
@@ -753,35 +740,6 @@ void s3fs_destroy(void*) {
     mutex_buf = NULL;
     curl_global_cleanup();
     pthread_mutex_destroy(&s3fs_descriptors_lock);
-}
-
-int s3fs_access(const char *path, int mask) {
-#ifdef DEBUG
-    syslog(LOG_INFO, "access[%s] mask[0%o]", path, mask);
-#endif
-
-    return 0;
-}
-
-// aka touch
-int s3fs_utimens(const char *path, const struct timespec ts[2]) {
-#ifdef DEBUG
-    syslog(LOG_INFO, "utimens[%s] mtime[%ld]", path, ts[1].tv_sec);
-#endif
-
-    Transaction t(path);
-
-    try {
-        get_fileinfo(&t);
-
-        t.info->mtime = ts[1].tv_sec;
-
-        copy_file(&t);
-
-        return 0;
-    } catch (int e) {
-        return e;
-    }
 }
 
 int my_fuse_opt_proc(void *data, const char *arg,

@@ -473,7 +473,10 @@ int S3request::get_file(std::string path, Fileinfo *info) {
         throw -errno;
 
     // delete it now so it will automatically be cleanup up when closed
-    unlink(localname);
+    if (unlink(localname) < 0) {
+        close(fd);
+        throw -errno;
+    }
 
     // zero-length files are easy to download
     if (info->size == 0)
