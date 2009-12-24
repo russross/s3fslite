@@ -86,8 +86,6 @@ string AWSSecretAccessKey;
 string host = "http://s3.amazonaws.com";
 mode_t root_mode = 0755;
 
-// if .size()==0 then local file cache is disabled
-string use_cache;
 string attr_cache;
 
 // private, public-read, public-read-write, authenticated-read
@@ -358,14 +356,6 @@ int s3fs_mkdir(const char *path, mode_t mode) {
 
 int generic_remove(Transaction *t) {
     attrcache->del(t->path);
-
-    string baseName = mybasename(t->path);
-    string resolved_path(use_cache + "/" + bucket);
-    string cache_path(resolved_path + t->path);
-
-    // delete the cache copy if it exists
-    if (use_cache.size() > 0)
-        unlink(cache_path.c_str());
 
     S3request::remove(t->path);
     return 0;
@@ -825,10 +815,6 @@ int my_fuse_opt_proc(void *data, const char *arg,
         // ### TODO: prefix
         if (strstr(arg, "retries=") != 0) {
             retries = atoi(strchr(arg, '=') + 1);
-            return 0;
-        }
-        if (strstr(arg, "use_cache=") != 0) {
-            use_cache = strchr(arg, '=') + 1;
             return 0;
         }
         if (strstr(arg, "connect_timeout=") != 0) {
