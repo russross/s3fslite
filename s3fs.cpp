@@ -114,28 +114,39 @@ class Transaction {
 Transaction::Transaction(std::string path, mode_t mode) {
     this->path = path;
     fd = -1;
+    info = NULL;
 
-    // is this for a new or existing file?
-    if (mode) {
-        info = new Fileinfo(path, getuid(), getgid(),
-                mode, time(NULL), 0, MD5_EMPTY);
-    } else {
-        // first check the cache
-        info = attrcache->get(path);
-        if (info)
-            return;
-
-        // special case for /
-        if (path == "/") {
+    try {
+        // is this for a new or existing file?
+        if (mode) {
             info = new Fileinfo(path, getuid(), getgid(),
-                    root_mode | S_IFDIR, time(NULL), 0, MD5_EMPTY);
+                    mode, time(NULL), 0, MD5_EMPTY);
         } else {
-            info = S3request::get_fileinfo(path);
+            // first check the cache
+            info = attrcache->get(path);
+            if (info)
+                return;
+
+            // special case for /
+            if (path == "/") {
+                info = new Fileinfo(path, getuid(), getgid(),
+                        root_mode | S_IFDIR, time(NULL), 0, MD5_EMPTY);
+            } else {
+                info = S3request::get_fileinfo(path);
+            }
+
+            // update the cache
+            // the fake "/" entry is cached, too, so that rsync can update it
+            attrcache->set(info);
+        }
+    } catch (int e) {
+        // dtor is never called if an exception is thrown in ctor
+        if (info) {
+            delete info;
+            info = NULL;
         }
 
-        // update the cache
-        // the fake "/" entry is cached, too, so that rsync can update it
-        attrcache->set(info);
+        throw e;
     }
 }
 
@@ -144,6 +155,7 @@ Transaction::~Transaction() {
     info = NULL;
 
     if (fd >= 0) {
+        // ignore any errors; exceptions inside dtors are frowned upon
         close(fd);
         fd = -1;
     }
@@ -219,15 +231,6 @@ int s3fs_getattr(const char *path, struct stat *stbuf) {
         }
         return e;
     }
-}
-
-int s3fs_access(const char *path, int mask) {
-#ifdef DEBUG
-    syslog(LOG_INFO, "access[%s] mask[0%o]", path, mask);
-#endif
-
-    // let anyone do anything
-    return 0;
 }
 
 int s3fs_open(const char *path, struct fuse_file_info *fi) {
