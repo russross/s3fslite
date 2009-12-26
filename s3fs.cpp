@@ -48,6 +48,7 @@
 #include "fileinfo.h"
 #include "attrcache.h"
 #include "s3request.h"
+#include "openfile.h"
 #include "s3fs.h"
 
 using namespace std;
@@ -71,6 +72,9 @@ string public_acl("public-read");
 Attrcache *attrcache;
 
 pthread_mutex_t *mutex_buf = NULL;
+
+pthread_t flush_thread;
+bool flush_shutdown;
 
 mimes_t mimeTypes;
 
@@ -103,104 +107,267 @@ int get_flags(int fd) {
 
 class Transaction {
     public:
-        Transaction(std::string path, mode_t mode = 0);
+        Transaction();
         ~Transaction();
 
+        void getExisting(std::string path);
+        void getNew(std::string path, mode_t mode);
+        void getPair(std::string source, std::string target);
+        void getFd();
+
         std::string path;
-        Fileinfo *info;
-        int fd;
+        Openfile *file;
+        Openfile *target;
 };
 
-Transaction::Transaction(std::string path, mode_t mode) {
-    this->path = path;
-    fd = -1;
-    info = NULL;
-
-    try {
-        // is this for a new or existing file?
-        if (mode) {
-            info = new Fileinfo(path, getuid(), getgid(),
-                    mode, time(NULL), 0, MD5_EMPTY);
-        } else {
-            // first check the cache
-            info = attrcache->get(path);
-            if (info)
-                return;
-
-            // special case for /
-            if (path == "/") {
-                info = new Fileinfo(path, getuid(), getgid(),
-                        root_mode | S_IFDIR, time(NULL), 0, MD5_EMPTY);
-            } else {
-                info = S3request::get_fileinfo(path);
-            }
-
-            // update the cache
-            // the fake "/" entry is cached, too, so that rsync can update it
-            attrcache->set(info);
-        }
-    } catch (int e) {
-        // dtor is never called if an exception is thrown in ctor
-        if (info) {
-            delete info;
-            info = NULL;
-        }
-
-        throw e;
-    }
+Transaction::Transaction() {
+    file = NULL;
+    target = NULL;
 }
 
 Transaction::~Transaction() {
-    delete info;
-    info = NULL;
-
-    if (fd >= 0) {
-        // ignore any errors; exceptions inside dtors are frowned upon
-        close(fd);
-        fd = -1;
+    if (file) {
+        file->release();
+        file = NULL;
+    }
+    if (target) {
+        target->release();
+        target = NULL;
     }
 }
 
-// copy a file, possibly onto itself (to update headers)
-void generic_copy_file(Transaction *t) {
-    // special case: for the root, just update the cache
-    if (t->path == "/") {
-        attrcache->del(t->path);
-        attrcache->set(t->info);
+void Transaction::getExisting(std::string path) {
+    this->path = path;
+    file = Openfile::get(path);
+    if (file->enqueued)
+        file->resurrected = true;
+
+    if (file->deleted)
+        throw -ENOENT;
+
+    // do we have the file info already?
+    if (file->info)
+        return;
+
+    // need to get the metadata
+    file->dirty_data = false;
+    file->dirty_metadata = false;
+
+    // first check the cache
+    file->info = attrcache->get(path);
+    if (file->info)
+        return;
+
+    // special case for /
+    if (path == "/") {
+        file->info = new Fileinfo(path, getuid(), getgid(),
+                root_mode | S_IFDIR, time(NULL), 0, MD5_EMPTY);
+    } else {
+        // assume it doesn't exist to cache a negative hit
+        file->newfile = true;
+        file->deleted = true;
+        file->info = S3request::get_fileinfo(path);
+
+        // oh.. it must exist
+        file->newfile = false;
+        file->deleted = false;
+    }
+
+    // update the cache
+    // the fake "/" entry is cached, too, so that rsync can update it
+    attrcache->set(file->info);
+}
+
+void Transaction::getNew(std::string path, mode_t mode) {
+    this->path = path;
+    file = Openfile::get(path, mode);
+    if (file->enqueued)
+        file->resurrected = true;
+
+    // Hmm.. still some possible race conditions here?
+    // FUSE seems to do a getattr before doing a mknod or mkdir,
+    // but I don't know if it handles races like:
+    //
+    // A: getattr         mknod
+    // B:         getattr       mknod
+    //
+    // The cache will make them unlikely to get through, but we
+    // don't catch them in all cases
+
+    // do we have the file info already?
+    if (file->info) {
+        if (!file->deleted)
+            throw -EEXIST;
+    } else {
+        file->info = new Fileinfo(path, getuid(), getgid(),
+                mode, time(NULL), 0, MD5_EMPTY);
+    }
+
+    file->newfile = true;
+    file->deleted = false;
+    file->dirty_data = true;
+    file->dirty_metadata = true;
+}
+
+void Transaction::getPair(std::string src, std::string tgt) {
+    // no renaming or linking the root
+    if (src == "/" || tgt == "/")
+        throw -ENOTSUP;
+
+    // acquire the locks in alphabetical order to prevent deadlocks
+    path = src;
+    if (src < tgt) {
+        file = Openfile::get(src);
+        target = Openfile::get(tgt);
+    } else {
+        target = Openfile::get(tgt);
+        file = Openfile::get(src);
+    }
+
+    // fail if either file is currently open
+    if (file->opencount > 0 || target->opencount > 0)
+        throw -EBUSY;
+
+    if (file->enqueued)
+        file->resurrected = true;
+    if (target->enqueued)
+        target->resurrected = true;
+
+    if (file->deleted)
+        throw -ENOENT;
+
+    // get the source file info
+    if (!file->info) {
+        // need to get the metadata
+        file->dirty_data = false;
+        file->dirty_metadata = false;
+
+        // first check the cache
+        file->info = attrcache->get(path);
+        if (file->info)
+            return;
+
+        // assume it doesn't exist to cache negative hits
+        file->newfile = true;
+        file->deleted = true;
+        file->info = S3request::get_fileinfo(src);
+
+        // it does exist after all
+        file->newfile = false;
+        file->deleted = false;
+
+        // update the cache
+        // the fake "/" entry is cached, too, so that rsync can update it
+        attrcache->set(file->info);
+    }
+
+    // throw away the target if it exists
+    if (target->info) {
+        delete target->info;
+        target->info = NULL;
+    }
+
+    target->deleted = true;
+
+    if (target->fd >= 0) {
+        close(target->fd);
+        target->fd = -1;
+    }
+}
+
+void Transaction::getFd() {
+    if (file->fd >= 0)
+        return;
+
+    // why download a zero-length file?
+    if (file->info->size == 0 || file->newfile)
+        file->fd = create_tempfile();
+    else
+        file->fd = S3request::get_file(path, file->info);
+}
+
+void sync_file(Openfile *file) {
+#ifdef DEBUG
+    syslog(LOG_INFO, "sync_file[%s]", file->path.c_str());
+#endif
+
+    // new file that was deleted before it was ever transmitted
+    if (file->newfile && file->deleted) {
+        syslog(LOG_INFO, "sync_file: newfile && deleted");
+
+        // this is what caching is all about
+    }
+
+    // deleted file: clear the cache and remove it from the server
+    else if (file->deleted) {
+        syslog(LOG_INFO, "sync_file: deleted");
+
+        attrcache->del(file->path);
+        S3request::remove(file->path);
+        file->newfile = true;
+    }
+
+    // new file, or one that has changed: in either case transmit it
+    else if (file->newfile || file->dirty_data) {
+        syslog(LOG_INFO, "sync_file: new || dirty_data");
+
+        // does this file have contents to be transmitted?
+        if (file->fd >= 0) {
+            struct stat st;
+            if (fstat(file->fd, &st) < 0)
+                throw -errno;
+
+            // grab the size from the local copy
+            file->info->size = st.st_size;
+        } else {
+            file->info->size = 0;
+        }
+
+        // clear the old entry from the cache, then update
+        attrcache->del(file->path);
+        S3request::put_file(file->info, file->fd);
+        attrcache->set(file->info);
+    }
+
+    // old file with metadata-only updates
+    else if (file->dirty_metadata) {
+        syslog(LOG_INFO, "sync_file: dirty_metadata");
+
+        // special case: for the root, just update the cache
+        if (file->path == "/") {
+            attrcache->del(file->path);
+            attrcache->set(file->info);
+
+            return;
+        }
+
+        // clear the old entry from the cache, then update
+        attrcache->del(file->path);
+        S3request::set_fileinfo(file->path, file->info);
+        attrcache->set(file->info);
+
         return;
     }
 
-    attrcache->del(t->path);
-
-    S3request::set_fileinfo(t->path, t->info);
-
-    // put the new name in the cache
-    attrcache->set(t->info);
+    // not new, not deleted, not updated; this is easy...
 }
 
-// create a new file/directory
-void generic_put(Transaction *t, int fd = -1) {
-    // does this file have contents to be transmitted?
-    if (fd >= 0) {
-        struct stat st;
-        if (fstat(fd, &st) < 0)
-            throw -errno;
-
-        // grab the size from the cached file
-        t->info->size = st.st_size;
+void *flush_loop(void *param) {
+    while (!flush_shutdown) {
+        Openfile *file = Openfile::from_queue();
+        if (file) {
+            sync_file(file);
+            file->release();
+            delete file;
+        } else {
+            sleep(1);
+        }
     }
 
-    attrcache->del(t->path);
-    S3request::put_file(t->info, fd);
-    attrcache->set(t->info);
-}
+    // TODO: clean everything up at the end
 
-// remove a file or directory
-void generic_remove(Transaction *t) {
-    attrcache->del(t->path);
-    S3request::remove(t->path);
+    return NULL;
 }
-
 
 //
 //
@@ -215,8 +382,13 @@ int s3fs_getattr(const char *path, struct stat *stbuf) {
 #endif
 
     try {
-        Transaction t(path);
-        t.info->toStat(stbuf);
+        Transaction t;
+        t.getExisting(path);
+
+        if (t.file->deleted)
+            throw -ENOENT;
+
+        t.file->info->toStat(stbuf);
 
         return 0;
     } catch (int e) {
@@ -238,45 +410,16 @@ int s3fs_open(const char *path, struct fuse_file_info *fi) {
     syslog(LOG_INFO, "open[%s] flags[0%o]", path, fi->flags);
 #endif
 
-    Transaction t(path);
-
-    // TODO: see if this file is already open
     try {
-        fi->fh = S3request::get_file(t.path, t.info);
+        Transaction t;
+        t.getExisting(path);
+        t.getFd();
 
-        // remember flags and headers...
-        auto_lock lock(s3fs_descriptors_lock);
-
-        s3fs_descriptors[fi->fh] = fi->flags;
+        t.file->opencount++;
 
         return 0;
     } catch (int e) {
         syslog(LOG_INFO, "open[%s]: %s", path, strerror(e));
-        return e;
-    }
-}
-
-int s3fs_flush(const char *path, struct fuse_file_info *fi) {
-#ifdef DEBUG
-    syslog(LOG_INFO, "flush[%s]", path);
-#endif
-
-    try {
-        Transaction t(path);
-
-        int fd = fi->fh;
-
-        // fi->flags is not available here
-        int flags = get_flags(fd);
-
-        // if it was opened with write permission, assume it has changed
-        // TODO: track if file was actually changed
-        if ((flags & O_RDWR) || (flags & O_WRONLY))
-            generic_put(&t, fd);
-
-        return 0;
-    } catch (int e) {
-        syslog(LOG_INFO, "flush[%s]: %s", path, strerror(e));
         return e;
     }
 }
@@ -286,11 +429,11 @@ int s3fs_release(const char *path, struct fuse_file_info *fi) {
     syslog(LOG_INFO, "release[%s]", path);
 #endif
 
-    // TODO: should not assume flush has been called
     try {
-        int fd = fi->fh;
-        if (close(fd) < 0)
-            throw -errno;
+        Transaction t;
+        t.getExisting(path);
+
+        t.file->opencount--;
 
         return 0;
     } catch (int e) {
@@ -305,6 +448,11 @@ int s3fs_fsync(const char *path, int datasync, struct fuse_file_info *fi) {
 #endif
 
     try {
+        Transaction t;
+        t.getExisting(path);
+
+        sync_file(t.file);
+
         return 0;
     } catch (int e) {
         syslog(LOG_INFO, "fsync[%s]: %s", path, strerror(e));
@@ -321,8 +469,8 @@ int s3fs_mknod(const char *path, mode_t mode, dev_t rdev) {
     // If pathname already exists, or is a symbolic link,
     // this call fails with an EEXIST error.
     try {
-        Transaction t(path, mode | S_IFREG);
-        generic_put(&t);
+        Transaction t;
+        t.getNew(path, mode | S_IFREG);
 
         return 0;
     } catch (int e) {
@@ -337,8 +485,8 @@ int s3fs_mkdir(const char *path, mode_t mode) {
 #endif
 
     try {
-        Transaction t(path, mode | S_IFDIR);
-        generic_put(&t);
+        Transaction t;
+        t.getNew(path, mode | S_IFDIR);
 
         return 0;
     } catch (int e) {
@@ -353,8 +501,10 @@ int s3fs_unlink(const char *path) {
 #endif
 
     try {
-        Transaction t(path);
-        generic_remove(&t);
+        Transaction t;
+        t.getExisting(path);
+
+        t.file->deleted = true;
 
         return 0;
     } catch (int e) {
@@ -369,7 +519,8 @@ int s3fs_rmdir(const char *path) {
 #endif
 
     try {
-        Transaction t(path);
+        Transaction t;
+        t.getExisting(path);
 
         // make sure the directory is empty
         string marker;
@@ -378,7 +529,7 @@ int s3fs_rmdir(const char *path) {
         if (entries.size() > 0)
             throw -ENOTEMPTY;
 
-        generic_remove(&t);
+        t.file->deleted = true;
 
         return 0;
     } catch (int e) {
@@ -393,18 +544,45 @@ int s3fs_rename(const char *from, const char *to) {
 #endif
 
     try {
-        Transaction t(from);
+        Transaction t;
 
-        // no renaming directories (yet)
-        if (t.info->mode & S_IFDIR)
+        // note: getPair sets source info, clears target info and fd
+        t.getPair(from, to);
+
+        // TODO: support renaming directories
+        if (t.file->info->mode & S_IFDIR)
             throw -ENOTSUP;
 
-        t.info->path = to;
-        generic_copy_file(&t);
+        // move the metadata over
+        t.target->info = t.file->info;
+        t.target->info->path = to;
+        t.file->info = NULL;
 
-        t.path = from;
-        t.info->path = from;
-        generic_remove(&t);
+        // if we have the file locally, move it locally
+        if (t.file->fd >= 0) {
+            t.target->fd = t.file->fd;
+            t.file->fd = -1;
+
+            t.target->newfile = true;
+            t.target->deleted = false;
+            t.target->dirty_data = true;
+            t.target->dirty_metadata = true;
+        }
+
+        // if we don't have the file locally, move it remotely
+        else {
+            // make sure the attr cache reflects what is on the server
+            attrcache->del(from);
+            S3request::set_fileinfo(from, t.target->info);
+            attrcache->set(t.target->info);
+
+            t.target->newfile = false;
+            t.target->deleted = false;
+            t.target->dirty_data = false;
+            t.target->dirty_metadata = false;
+        }
+
+        t.file->deleted = true;
 
         return 0;
     } catch (int e) {
@@ -419,14 +597,40 @@ int s3fs_link(const char *from, const char *to) {
 #endif
 
     try {
-        Transaction t(from);
+        Transaction t;
+
+        // note: getPair sets source info, clears target info and fd
+        t.getPair(from, to);
 
         // no linking directories
-        if (t.info->mode & S_IFDIR)
+        if (t.file->info->mode & S_IFDIR)
             throw -ENOTSUP;
 
-        t.info->path = to;
-        generic_copy_file(&t);
+        // copy the metadata over
+        t.target->info = new Fileinfo(*t.file->info);
+
+        // if we have the file locally, dup the fd to link them locally
+        if (t.file->fd >= 0) {
+            t.target->fd = dup(t.file->fd);
+
+            t.target->newfile = true;
+            t.target->deleted = false;
+            t.target->dirty_data = true;
+            t.target->dirty_metadata = true;
+        }
+
+        // if we don't have the file locally, copy it remotely
+        else {
+            // make sure the attr cache reflects what is on the server
+            t.target->info->path = to;
+            S3request::set_fileinfo(from, t.target->info);
+            attrcache->set(t.target->info);
+
+            t.target->newfile = false;
+            t.target->deleted = false;
+            t.target->dirty_data = false;
+            t.target->dirty_metadata = false;
+        }
 
         return 0;
     } catch (int e) {
@@ -441,16 +645,13 @@ int s3fs_symlink(const char *from, const char *to) {
 #endif
 
     try {
-        Transaction t(to, S_IFLNK);
-
-        // create a temporary local file
-        t.fd = create_tempfile();
+        Transaction t;
+        t.getNew(to, S_IFLNK);
+        t.getFd();
 
         // put the link target into a file
-        if (pwrite(t.fd, from, strlen(from), 0) < 0)
+        if (pwrite(t.file->fd, from, strlen(from), 0) < 0)
             throw -errno;
-
-        generic_put(&t, t.fd);
 
         return 0;
     } catch (int e) {
@@ -470,17 +671,18 @@ int s3fs_readlink(const char *path, char *buf, size_t size) {
         return 0;
 
     try {
-        Transaction t(path);
-        t.fd = S3request::get_file(t.path, t.info);
+        Transaction t;
+        t.getExisting(path);
+        t.getFd();
 
         struct stat st;
-        if (fstat(t.fd, &st) < 0)
+        if (fstat(t.file->fd, &st) < 0)
             throw -errno;
 
         if ((size_t) st.st_size < size)
             size = st.st_size;
 
-        if (pread(t.fd, buf, size, 0) < 0)
+        if (pread(t.file->fd, buf, size, 0) < 0)
             throw -errno;
 
         buf[size] = 0;
@@ -498,14 +700,17 @@ int s3fs_chmod(const char *path, mode_t mode) {
 #endif
 
     try {
-        Transaction t(path);
+        Transaction t;
+        t.getExisting(path);
 
         // make sure we have a file type
         if (!(mode & S_IFMT))
-            mode |= (t.info->mode & S_IFMT);
+            mode |= (t.file->info->mode & S_IFMT);
 
-        t.info->mode = mode;
-        generic_copy_file(&t);
+        if (t.file->info->mode != mode) {
+            t.file->info->mode = mode;
+            t.file->dirty_metadata = true;
+        }
 
         return 0;
     } catch (int e) {
@@ -520,15 +725,18 @@ int s3fs_chown(const char *path, uid_t uid, gid_t gid) {
 #endif
 
     try {
-        Transaction t(path);
+        Transaction t;
+        t.getExisting(path);
 
         // uid or gid < 0 indicates no change
-        if ((int) uid >= 0)
-            t.info->uid = uid;
-        if ((int) gid >= 0)
-            t.info->gid = gid;
-
-        generic_copy_file(&t);
+        if ((int) uid >= 0 && t.file->info->uid != uid) {
+            t.file->info->uid = uid;
+            t.file->dirty_metadata = true;
+        }
+        if ((int) gid >= 0 && t.file->info->gid != gid) {
+            t.file->info->gid = gid;
+            t.file->dirty_metadata = true;
+        }
 
         return 0;
     } catch (int e) {
@@ -543,10 +751,13 @@ int s3fs_utimens(const char *path, const struct timespec ts[2]) {
 #endif
 
     try {
-        Transaction t(path);
+        Transaction t;
+        t.getExisting(path);
 
-        t.info->mtime = ts[1].tv_sec;
-        generic_copy_file(&t);
+        if (t.file->info->mtime != ts[1].tv_sec) {
+            t.file->info->mtime = ts[1].tv_sec;
+            t.file->dirty_metadata = true;
+        }
 
         return 0;
     } catch (int e) {
@@ -563,15 +774,26 @@ int s3fs_truncate(const char *path, off_t size) {
 #endif
 
     try {
-        Transaction t(path);
+        Transaction t;
+        t.getExisting(path);
 
-        // TODO: support all sizes of truncates
-        if (size != 0)
-            throw -ENOTSUP;
+        // the easy case
+        if ((size_t) size == t.file->info->size)
+            return 0;
 
-        // this is just like creating a new file of length zero,
-        // but keeping the old attributes
-        generic_put(&t);
+        // we don't have it locally
+        if (size == 0)
+            t.file->info->size = 0;
+
+        // this will only download if we don't have it and size > 0
+        t.getFd();
+
+        if (ftruncate(t.file->fd, size) < 0)
+            throw -errno;
+
+        t.file->info->mtime = time(NULL);
+        t.file->dirty_data = true;
+        t.file->dirty_metadata = true;
 
         return 0;
     } catch (int e) {
@@ -589,7 +811,10 @@ int s3fs_read(const char *path, char *buf,
 #endif
 
     try {
-        int res = pread(fi->fh, buf, size, offset);
+        Transaction t;
+        t.getExisting(path);
+
+        int res = pread(t.file->fd, buf, size, offset);
         if (res < 0)
             throw -errno;
 
@@ -609,9 +834,14 @@ int s3fs_write(const char *path, const char *buf,
 #endif
 
     try {
-        int res = pwrite(fi->fh, buf, size, offset);
+        Transaction t;
+        t.getExisting(path);
+
+        int res = pwrite(t.file->fd, buf, size, offset);
         if (res < 0)
             throw -errno;
+
+        t.file->dirty_data = true;
 
         return res;
     } catch (int e) {
@@ -629,6 +859,9 @@ int s3fs_readdir(const char *path, void *buf,
 #endif
 
     try {
+        Transaction t;
+        t.getExisting(path);
+
         filler(buf, ".", 0, 0);
         filler(buf, "..", 0, 0);
 
@@ -709,6 +942,11 @@ void *s3fs_init(struct fuse_conn_info *conn) {
             mimeTypes[ext] = mimeType;
         }
     }
+
+    flush_shutdown = false;
+    pthread_create(&flush_thread, NULL,
+            (void *(*)(void *)) flush_loop, (void *) NULL);
+
     return 0;
 }
 
@@ -729,6 +967,9 @@ int s3fs_statfs(const char *path, struct statvfs *stbuf) {
 
 void s3fs_destroy(void*) {
     syslog(LOG_INFO, "destroy[%s]", bucket.c_str());
+
+    flush_shutdown = true;
+    pthread_join(flush_thread, NULL);
 
     // openssl
     CRYPTO_set_id_callback(NULL);
@@ -769,7 +1010,6 @@ int my_fuse_opt_proc(void *data, const char *arg,
             default_acl = strchr(arg, '=') + 1;
             return 0;
         }
-        // ### TODO: prefix
         if (strstr(arg, "retries=") != 0) {
             retries = atoi(strchr(arg, '=') + 1);
             return 0;
@@ -854,7 +1094,6 @@ int main(int argc, char *argv[]) {
     s3fs_oper.read = s3fs_read;
     s3fs_oper.write = s3fs_write;
     s3fs_oper.statfs = s3fs_statfs;
-    s3fs_oper.flush = s3fs_flush;
     s3fs_oper.release = s3fs_release;
     s3fs_oper.fsync = s3fs_fsync;
     s3fs_oper.readdir = s3fs_readdir;
