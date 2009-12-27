@@ -65,9 +65,9 @@ This fork has the following changes:
     browsers. Setting the `default_acl` option overrides this, and
     sets everything to the specified ACL.
 
-*   MD5 sums are computed for all uploads. S3 verifies the checksum
-    on the received data, ensuring that no data was corrupted in
-    transit (at least not during uploads).
+*   MD5 sums are computed for all uploads and downloads. S3 provides
+    MD5 hash values on downloads, and verifies them on the received
+    data for uploads, ensuring that no data is corrupted in transit.
 
 *   The `use_cache` option has been removed. An on-disk cache is not
     currently supported, except for the short-term writeback cache.

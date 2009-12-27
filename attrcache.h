@@ -13,7 +13,7 @@ class Attrcache {
     public:
         Attrcache(std::string bucket, std::string prefix);
         Fileinfo *get(std::string path);
-        void set(std::string path, struct stat *info, std::string etag);
+        void set(std::string path, struct stat *info);
         void set(Fileinfo *info);
         void del(std::string path);
         ~Attrcache();

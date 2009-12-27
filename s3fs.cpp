@@ -160,7 +160,7 @@ void Transaction::getExisting(std::string path) {
     // special case for /
     if (path == "/") {
         file->info = new Fileinfo(path, getuid(), getgid(),
-                root_mode | S_IFDIR, time(NULL), 0, MD5_EMPTY);
+                root_mode | S_IFDIR, time(NULL), 0);
     } else {
         // assume it doesn't exist to cache a negative hit
         file->exists = false;
@@ -199,7 +199,7 @@ void Transaction::getNew(std::string path, mode_t mode) {
             throw -EEXIST;
     } else {
         file->info = new Fileinfo(path, getuid(), getgid(),
-                mode, time(NULL), 0, MD5_EMPTY);
+                mode, time(NULL), 0);
     }
 
     file->exists = false;

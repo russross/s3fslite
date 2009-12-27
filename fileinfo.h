@@ -12,12 +12,11 @@ class Fileinfo {
         mode_t mode;
         time_t mtime;
         size_t size;
-        std::string etag;
 
-        Fileinfo(std::string path, struct stat *info, std::string etag);
+        Fileinfo(std::string path, struct stat *info);
         Fileinfo(std::string path, unsigned uid, unsigned gid,
-                mode_t mode, time_t mtime, size_t size, std::string etag);
+                mode_t mode, time_t mtime, size_t size);
         void set(std::string path, unsigned uid, unsigned gid,
-                mode_t mode, time_t mtime, size_t size, std::string etag);
+                mode_t mode, time_t mtime, size_t size);
         void toStat(struct stat *info);
 };

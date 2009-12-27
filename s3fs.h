@@ -6,7 +6,6 @@
 
 #define DEFAULT_MIME_TYPE "application/octet-stream"
 #define DIRECTORY_MIME_TYPE "application/x-directory"
-#define MD5_EMPTY "d41d8cd98f00b204e9800998ecf8427e"
 
 std::string trim_spaces(const std::string &s);
 std::string trim_quotes(const std::string &s);

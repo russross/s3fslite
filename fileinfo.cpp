@@ -6,18 +6,18 @@
 #include "fileinfo.h"
 
 Fileinfo::Fileinfo(std::string path, unsigned uid, unsigned gid,
-        mode_t mode, time_t mtime, size_t size, std::string etag)
+        mode_t mode, time_t mtime, size_t size)
 {
-    set(path, uid, gid, mode, mtime, size, etag);
+    set(path, uid, gid, mode, mtime, size);
 }
 
-Fileinfo::Fileinfo(std::string path, struct stat *info, std::string etag) {
+Fileinfo::Fileinfo(std::string path, struct stat *info) {
     set(path, info->st_uid, info->st_gid, info->st_mode, info->st_mtime,
-            info->st_size, etag);
+            info->st_size);
 }
 
 void Fileinfo::set(std::string path, unsigned uid, unsigned gid,
-    mode_t mode, time_t mtime, size_t size, std::string etag)
+    mode_t mode, time_t mtime, size_t size)
 {
     this->path = path;
     this->uid = uid;
@@ -25,7 +25,6 @@ void Fileinfo::set(std::string path, unsigned uid, unsigned gid,
     this->mode = mode;
     this->mtime = mtime;
     this->size = size;
-    this->etag = etag;
 }
 
 void Fileinfo::toStat(struct stat *info) {

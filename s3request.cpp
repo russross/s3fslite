@@ -188,9 +188,6 @@ unsigned char *get_md5(int fd) {
             throw -EIO;
     }
 
-    // leave the file at the beginning so it is ready for uploading
-    lseek(fd, 0, SEEK_SET);
-
     unsigned char *md = new unsigned char[MD5_DIGEST_LENGTH];
     if (MD5_Final(md, &c) != 1) {
         delete[] md;
@@ -419,9 +416,8 @@ Fileinfo *S3request::get_fileinfo(std::string path) {
     size_t size = longnum(response["Content-Length"]);
     unsigned uid = num(response["x-amz-meta-uid"]);
     unsigned gid = num(response["x-amz-meta-gid"]);
-    std::string etag(trim_quotes(response["ETag"]));
 
-    return new Fileinfo(path, uid, gid, mode, mtime, size, etag);
+    return new Fileinfo(path, uid, gid, mode, mtime, size);
 }
 
 // path is the source file to copy
@@ -486,6 +482,11 @@ int S3request::get_file(std::string path, Fileinfo *info) {
         return fd;
 
     S3request req(path);
+    headers_t response;
+
+    // store the response headers in a map
+    curl_easy_setopt(req.curl, CURLOPT_HEADERDATA, &response);
+    curl_easy_setopt(req.curl, CURLOPT_HEADERFUNCTION, header_callback);
 
     int dupfd = dup(fd);
     if (dupfd < 0) {
@@ -509,6 +510,21 @@ int S3request::get_file(std::string path, Fileinfo *info) {
     req.sign_request("GET", "", "", date);
 
     req.execute();
+
+    // check its md5 sum
+    std::string etag = trim_quotes(response["ETag"]);
+    fflush(req.fp);
+    unsigned char *md = get_md5(fd);
+    std::string md5sum = md5_to_string(md);
+    delete[] md;
+
+    if (md5sum != etag) {
+        // file corrupted during download
+        syslog(LOG_ERR, "S3request::get_file md5: expected[%s] received[%s]",
+                etag.c_str(), md5sum.c_str());
+        close(fd);
+        throw -EIO;
+    }
 
     // the FILE * and dupfd will be closed when req is deleted
 
@@ -545,9 +561,7 @@ void S3request::put_file(Fileinfo *info, int fd) {
         curl_easy_setopt(req.curl, CURLOPT_INFILESIZE, 0);
     } else {
         // set it up to upload from a file descriptor
-        lseek(fd, 0, SEEK_SET);
         unsigned char *md = get_md5(fd);
-        info->etag = md5_to_string(md);
         md5sum = base64_encode(md, MD5_DIGEST_LENGTH);
         delete[] md;
 

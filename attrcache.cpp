@@ -38,7 +38,6 @@ Attrcache::Attrcache(std::string bucket, std::string prefix) {
         "    mode INTEGER,\n"
         "    mtime INTEGER,\n"
         "    size INTEGER,\n"
-        "    etag VARCHAR(96),\n"
         "    PRIMARY KEY (path)\n"
         ")",
         &result, &rows, &columns, &err);
@@ -62,7 +61,7 @@ Fileinfo *Attrcache::get(std::string path) {
 
     // perform the query
     query = sqlite3_mprintf(
-        "SELECT uid, gid, mode, mtime, size, etag FROM cache WHERE path = '%q'",
+        "SELECT uid, gid, mode, mtime, size FROM cache WHERE path = '%q'",
         path.c_str());
     int status = sqlite3_get_table(conn, query, &data, &rows, &columns, &err);
     sqlite3_free(query);
@@ -83,18 +82,17 @@ Fileinfo *Attrcache::get(std::string path) {
     // get the data from the second row
     Fileinfo *result = new Fileinfo(
             path,
-            strtoul(data[6], NULL, 10), // uid
-            strtoul(data[7], NULL, 10), // gid
-            strtoul(data[8], NULL, 10), // mode
-            strtoul(data[9], NULL, 10), // mtime
-            strtoul(data[10], NULL, 10), // size
-            data[11]); // etag
+            strtoul(data[5], NULL, 10), // uid
+            strtoul(data[6], NULL, 10), // gid
+            strtoul(data[7], NULL, 10), // mode
+            strtoul(data[8], NULL, 10), // mtime
+            strtoul(data[9], NULL, 10)); // size
     sqlite3_free_table(data);
 
     return result;
 }
 
-void Attrcache::set(std::string path, struct stat *info, std::string etag) {
+void Attrcache::set(std::string path, struct stat *info) {
     char **result;
     int rows;
     int columns;
@@ -105,15 +103,14 @@ void Attrcache::set(std::string path, struct stat *info, std::string etag) {
     del(path);
 
     query = sqlite3_mprintf(
-        "INSERT INTO cache (path, uid, gid, mode, mtime, size, etag)\n"
-        "VALUES ('%q', '%u', '%u', '%u', '%u', '%llu', '%q')",
+        "INSERT INTO cache (path, uid, gid, mode, mtime, size)\n"
+        "VALUES ('%q', '%u', '%u', '%u', '%u', '%llu')",
         path.c_str(),
         info->st_uid,
         info->st_gid,
         info->st_mode,
         info->st_mtime,
-        info->st_size,
-        etag.c_str());
+        info->st_size);
     if (sqlite3_get_table(conn, query, &result, &rows, &columns, &err) ==
             SQLITE_OK)
     {
@@ -128,7 +125,7 @@ void Attrcache::set(std::string path, struct stat *info, std::string etag) {
 void Attrcache::set(Fileinfo *info) {
     struct stat attr;
     info->toStat(&attr);
-    set(info->path, &attr, info->etag);
+    set(info->path, &attr);
 }
 
 void Attrcache::del(std::string path) {
