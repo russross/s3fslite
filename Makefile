@@ -1,8 +1,8 @@
-SOURCES=s3fs.cpp fileinfo.cpp attrcache.cpp s3request.cpp
+SOURCES=s3fs.cpp fileinfo.cpp attrcache.cpp s3request.cpp openfile.cpp
 
 CPP=g++
 
-CPPFLAGS=-ggdb -Wall -Wextra -Wno-unused-parameter -Os \
+CPPFLAGS=-Wall -Wextra -Wno-unused-parameter -Werror -Os \
 	$(shell pkg-config fuse --cflags) \
 	$(shell pkg-config libcurl --cflags) \
 	$(shell pkg-config sqlite3 --cflags) \

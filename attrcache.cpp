@@ -3,7 +3,6 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <syslog.h>
-#include <pthread.h>
 #include <sqlite3.h>
 
 #include "fileinfo.h"
@@ -23,9 +22,6 @@ Attrcache::Attrcache(std::string bucket, std::string prefix) {
     int columns;
     char *err;
     int status;
-
-    pthread_mutex_init(&lock, NULL);
-    auto_lock sync(lock);
 
     if (sqlite3_open(name.c_str(), &conn) != SQLITE_OK) {
         std::cerr << "Can't open database: " << name << ": " <<
@@ -54,11 +50,7 @@ Attrcache::Attrcache(std::string bucket, std::string prefix) {
 }
 
 Attrcache::~Attrcache() {
-    {
-        auto_lock sync(lock);
-        sqlite3_close(conn);
-    }
-    pthread_mutex_destroy(&lock);
+    sqlite3_close(conn);
 }
 
 Fileinfo *Attrcache::get(std::string path) {
@@ -67,8 +59,6 @@ Fileinfo *Attrcache::get(std::string path) {
     int columns;
     char *err;
     char *query;
-
-    auto_lock sync(lock);
 
     // perform the query
     query = sqlite3_mprintf(
@@ -114,8 +104,6 @@ void Attrcache::set(std::string path, struct stat *info, std::string etag) {
     // make sure there isn't an existing entry
     del(path);
 
-    auto_lock sync(lock);
-
     query = sqlite3_mprintf(
         "INSERT INTO cache (path, uid, gid, mode, mtime, size, etag)\n"
         "VALUES ('%q', '%u', '%u', '%u', '%u', '%llu', '%q')",
@@ -149,8 +137,6 @@ void Attrcache::del(std::string path) {
     int columns;
     char *err;
     char *query;
-
-    auto_lock sync(lock);
 
     query = sqlite3_mprintf(
         "DELETE FROM cache WHERE path = '%q'",

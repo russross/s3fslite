@@ -71,7 +71,7 @@ string public_acl("public-read");
 
 Attrcache *attrcache;
 
-pthread_mutex_t *mutex_buf = NULL;
+pthread_mutex_t lock;
 
 pthread_t flush_thread;
 bool flush_shutdown;
@@ -79,8 +79,6 @@ bool flush_shutdown;
 mimes_t mimeTypes;
 
 // fd -> flags
-map<int, int> s3fs_descriptors;
-pthread_mutex_t s3fs_descriptors_lock;
 static std::string SPACES(" \t\r\n");
 static std::string QUOTES("\"");
 
@@ -98,11 +96,6 @@ std::string trim_quotes(const std::string &s) {
     if (start == string::npos || end == string::npos)
         return "";
     return s.substr(start, end + 1 - start);
-}
-
-int get_flags(int fd) {
-    auto_lock lock(s3fs_descriptors_lock);
-    return s3fs_descriptors[fd];
 }
 
 class Transaction {
@@ -123,6 +116,9 @@ class Transaction {
 Transaction::Transaction() {
     file = NULL;
     target = NULL;
+
+    // acquire the global lock
+    pthread_mutex_lock(&lock);
 }
 
 Transaction::~Transaction() {
@@ -134,6 +130,9 @@ Transaction::~Transaction() {
         target->release();
         target = NULL;
     }
+
+    // release the global lock
+    pthread_mutex_unlock(&lock);
 }
 
 void Transaction::getExisting(std::string path) {
@@ -164,12 +163,12 @@ void Transaction::getExisting(std::string path) {
                 root_mode | S_IFDIR, time(NULL), 0, MD5_EMPTY);
     } else {
         // assume it doesn't exist to cache a negative hit
-        file->newfile = true;
+        file->exists = false;
         file->deleted = true;
         file->info = S3request::get_fileinfo(path);
 
         // oh.. it must exist
-        file->newfile = false;
+        file->exists = true;
         file->deleted = false;
     }
 
@@ -203,7 +202,7 @@ void Transaction::getNew(std::string path, mode_t mode) {
                 mode, time(NULL), 0, MD5_EMPTY);
     }
 
-    file->newfile = true;
+    file->exists = false;
     file->deleted = false;
     file->dirty_data = true;
     file->dirty_metadata = true;
@@ -248,12 +247,12 @@ void Transaction::getPair(std::string src, std::string tgt) {
             return;
 
         // assume it doesn't exist to cache negative hits
-        file->newfile = true;
+        file->exists = false;
         file->deleted = true;
         file->info = S3request::get_fileinfo(src);
 
         // it does exist after all
-        file->newfile = false;
+        file->exists = true;
         file->deleted = false;
 
         // update the cache
@@ -280,91 +279,32 @@ void Transaction::getFd() {
         return;
 
     // why download a zero-length file?
-    if (file->info->size == 0 || file->newfile)
+    if (file->info->size == 0 || !file->exists)
         file->fd = create_tempfile();
     else
         file->fd = S3request::get_file(path, file->info);
 }
 
-void sync_file(Openfile *file) {
-#ifdef DEBUG
-    syslog(LOG_INFO, "sync_file[%s]", file->path.c_str());
-#endif
-
-    // new file that was deleted before it was ever transmitted
-    if (file->newfile && file->deleted) {
-        syslog(LOG_INFO, "sync_file: newfile && deleted");
-
-        // this is what caching is all about
-    }
-
-    // deleted file: clear the cache and remove it from the server
-    else if (file->deleted) {
-        syslog(LOG_INFO, "sync_file: deleted");
-
-        attrcache->del(file->path);
-        S3request::remove(file->path);
-        file->newfile = true;
-    }
-
-    // new file, or one that has changed: in either case transmit it
-    else if (file->newfile || file->dirty_data) {
-        syslog(LOG_INFO, "sync_file: new || dirty_data");
-
-        // does this file have contents to be transmitted?
-        if (file->fd >= 0) {
-            struct stat st;
-            if (fstat(file->fd, &st) < 0)
-                throw -errno;
-
-            // grab the size from the local copy
-            file->info->size = st.st_size;
-        } else {
-            file->info->size = 0;
-        }
-
-        // clear the old entry from the cache, then update
-        attrcache->del(file->path);
-        S3request::put_file(file->info, file->fd);
-        attrcache->set(file->info);
-    }
-
-    // old file with metadata-only updates
-    else if (file->dirty_metadata) {
-        syslog(LOG_INFO, "sync_file: dirty_metadata");
-
-        // special case: for the root, just update the cache
-        if (file->path == "/") {
-            attrcache->del(file->path);
-            attrcache->set(file->info);
-
-            return;
-        }
-
-        // clear the old entry from the cache, then update
-        attrcache->del(file->path);
-        S3request::set_fileinfo(file->path, file->info);
-        attrcache->set(file->info);
-
-        return;
-    }
-
-    // not new, not deleted, not updated; this is easy...
-}
-
 void *flush_loop(void *param) {
+    pthread_mutex_lock(&lock);
+
     while (!flush_shutdown) {
         Openfile *file = Openfile::from_queue();
         if (file) {
-            sync_file(file);
+            file->fsync();
             file->release();
             delete file;
         } else {
+            pthread_mutex_unlock(&lock);
             sleep(1);
+            pthread_mutex_lock(&lock);
         }
     }
 
-    // TODO: clean everything up at the end
+    // sync everything when shutting down
+    Openfile::sync();
+
+    pthread_mutex_unlock(&lock);
 
     return NULL;
 }
@@ -451,7 +391,7 @@ int s3fs_fsync(const char *path, int datasync, struct fuse_file_info *fi) {
         Transaction t;
         t.getExisting(path);
 
-        sync_file(t.file);
+        t.file->fsync();
 
         return 0;
     } catch (int e) {
@@ -522,6 +462,9 @@ int s3fs_rmdir(const char *path) {
         Transaction t;
         t.getExisting(path);
 
+        // sync any deleted files inside this directory
+        Openfile::sync();
+
         // make sure the directory is empty
         string marker;
         stringlist entries;
@@ -563,7 +506,7 @@ int s3fs_rename(const char *from, const char *to) {
             t.target->fd = t.file->fd;
             t.file->fd = -1;
 
-            t.target->newfile = true;
+            t.target->exists = false;
             t.target->deleted = false;
             t.target->dirty_data = true;
             t.target->dirty_metadata = true;
@@ -576,7 +519,7 @@ int s3fs_rename(const char *from, const char *to) {
             S3request::set_fileinfo(from, t.target->info);
             attrcache->set(t.target->info);
 
-            t.target->newfile = false;
+            t.target->exists = true;
             t.target->deleted = false;
             t.target->dirty_data = false;
             t.target->dirty_metadata = false;
@@ -613,7 +556,7 @@ int s3fs_link(const char *from, const char *to) {
         if (t.file->fd >= 0) {
             t.target->fd = dup(t.file->fd);
 
-            t.target->newfile = true;
+            t.target->exists = false;
             t.target->deleted = false;
             t.target->dirty_data = true;
             t.target->dirty_metadata = true;
@@ -626,7 +569,7 @@ int s3fs_link(const char *from, const char *to) {
             S3request::set_fileinfo(from, t.target->info);
             attrcache->set(t.target->info);
 
-            t.target->newfile = false;
+            t.target->exists = true;
             t.target->deleted = false;
             t.target->dirty_data = false;
             t.target->dirty_metadata = false;
@@ -862,6 +805,9 @@ int s3fs_readdir(const char *path, void *buf,
         Transaction t;
         t.getExisting(path);
 
+        // sync everything inside the directory
+        Openfile::sync();
+
         filler(buf, ".", 0, 0);
         filler(buf, "..", 0, 0);
 
@@ -887,44 +833,14 @@ int s3fs_readdir(const char *path, void *buf,
     }
 }
 
-/**
- * OpenSSL locking function.
- *
- * @param    mode    lock mode
- * @param    n        lock number
- * @param    file    source file name
- * @param    line    source file line number
- * @return    none
- */
-void locking_function(int mode, int n, const char *file, int line) {
-    if (mode & CRYPTO_LOCK) {
-        pthread_mutex_lock(&mutex_buf[n]);
-    } else {
-        pthread_mutex_unlock(&mutex_buf[n]);
-    }
-}
-
-/**
- * OpenSSL uniq id function.
- *
- * @return    thread id
- */
-unsigned long id_function(void) {
-    return ((unsigned long) pthread_self());
-}
-
 void *s3fs_init(struct fuse_conn_info *conn) {
     syslog(LOG_INFO, "init[%s]", bucket.c_str());
 
+    // global lock
+    pthread_mutex_init(&lock, NULL);
+
     // openssl
-    mutex_buf = static_cast<pthread_mutex_t *>(
-            malloc(CRYPTO_num_locks() * sizeof(pthread_mutex_t)));
-    for (int i = 0; i < CRYPTO_num_locks(); i++)
-        pthread_mutex_init(&mutex_buf[i], NULL);
-    CRYPTO_set_locking_callback(locking_function);
-    CRYPTO_set_id_callback(id_function);
     curl_global_init(CURL_GLOBAL_ALL);
-    pthread_mutex_init(&s3fs_descriptors_lock, NULL);
 
     string line;
     ifstream passwd("/etc/mime.types");
@@ -971,15 +887,8 @@ void s3fs_destroy(void*) {
     flush_shutdown = true;
     pthread_join(flush_thread, NULL);
 
-    // openssl
-    CRYPTO_set_id_callback(NULL);
-    CRYPTO_set_locking_callback(NULL);
-    for (int i = 0; i < CRYPTO_num_locks(); i++)
-        pthread_mutex_destroy(&mutex_buf[i]);
-    free(mutex_buf);
-    mutex_buf = NULL;
     curl_global_cleanup();
-    pthread_mutex_destroy(&s3fs_descriptors_lock);
+    pthread_mutex_destroy(&lock);
 }
 
 int my_fuse_opt_proc(void *data, const char *arg,

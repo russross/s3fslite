@@ -340,7 +340,7 @@ void S3request::execute() {
         if (curlCode == 0) {
             return;
         } else if (curlCode == CURLE_OPERATION_TIMEDOUT) {
-#ifdef DEBUG
+#ifdef DEBUG_WIRE
             syslog(LOG_INFO, "curl timeout");
 #endif
         } else if (curlCode == CURLE_HTTP_RETURNED_ERROR) {
@@ -363,7 +363,7 @@ void S3request::execute() {
         } else {
             syslog(LOG_ERR, "curl error[%s]", curl_easy_strerror(curlCode));;
         }
-#ifdef DEBUG
+#ifdef DEBUG_WIRE
         syslog(LOG_INFO, "curl retrying...");
 #endif
     }
@@ -372,7 +372,7 @@ void S3request::execute() {
 }
 
 Fileinfo *S3request::get_fileinfo(std::string path) {
-#ifdef DEBUG
+#ifdef DEBUG_WIRE
     syslog(LOG_INFO, "S3request::get_fileinfo[%s]", path.c_str());
 #endif
 
@@ -428,7 +428,7 @@ Fileinfo *S3request::get_fileinfo(std::string path) {
 // info contains the details to set, and the target path
 // if path and info->path are the same, the file is updated in place
 void S3request::set_fileinfo(std::string path, Fileinfo *info) {
-#ifdef DEBUG
+#ifdef DEBUG_WIRE
     syslog(LOG_INFO, "S3request::set_fileinfo[%s]", path.c_str());
 #endif
 
@@ -464,7 +464,7 @@ void S3request::set_fileinfo(std::string path, Fileinfo *info) {
     req.add_header("x-amz-metadata-directive:REPLACE");
     req.sign_request("PUT", "", content_type, date);
 
-#ifdef DEBUG
+#ifdef DEBUG_WIRE
     syslog(LOG_INFO, "copying[%s] -> [%s]", path.c_str(), info->path.c_str());
 #endif
 
@@ -472,7 +472,7 @@ void S3request::set_fileinfo(std::string path, Fileinfo *info) {
 }
 
 int S3request::get_file(std::string path, Fileinfo *info) {
-#ifdef DEBUG
+#ifdef DEBUG_WIRE
     syslog(LOG_INFO, "S3request::get_file[%s]", path.c_str());
 #endif
 
@@ -516,7 +516,7 @@ int S3request::get_file(std::string path, Fileinfo *info) {
 }
 
 void S3request::put_file(Fileinfo *info, int fd) {
-#ifdef DEBUG
+#ifdef DEBUG_WIRE
     syslog(LOG_INFO, "S3request::put_file[%s]", info->path.c_str());
 #endif
 
@@ -583,7 +583,7 @@ void S3request::put_file(Fileinfo *info, int fd) {
     req.add_header("x-amz-meta-uid:" + str(info->uid));
     req.sign_request("PUT", md5sum, content_type, date);
 
-#ifdef DEBUG
+#ifdef DEBUG_WIRE
     if (fd >= 0 && info->size > 0) {
         syslog(LOG_INFO, "uploading[%s] size[%llu]", info->path.c_str(),
                 (unsigned long long) info->size);
@@ -594,7 +594,7 @@ void S3request::put_file(Fileinfo *info, int fd) {
 }
 
 void S3request::remove(std::string path) {
-#ifdef DEBUG
+#ifdef DEBUG_WIRE
     syslog(LOG_INFO, "S3request::remove[%s]", path.c_str());
 #endif
 
@@ -621,7 +621,7 @@ void S3request::remove(std::string path) {
 int S3request::get_directory(std::string path, std::string &marker,
         stringlist &result, int max_entries)
 {
-#ifdef DEBUG
+#ifdef DEBUG_WIRE
     syslog(LOG_INFO, "S3request::get_directory[%s] marker[%s]", path.c_str(),
             marker.c_str());
 #endif
