@@ -118,6 +118,10 @@ Inside this file, put your access key and your secret access key
 
     ACCESSKEY:SECRETACCESSKEY
 
+To protect your secret key, make the file only accessible by `root`:
+
+    sudo chmod 600 /etc/passwd-s3fs
+
 
 Mounting a file system
 ----------------------
@@ -135,8 +139,9 @@ versions of s3fs already), mount it like this:
 
     sudo s3fs <bucket> <mountpoint> -o attr_cache=/var/cache/s3fs -o allow_other
 
-This mounts the file system with a file cache and allows all users
-of the local machine to use the mount.
+This mounts the file system with the attribute cache database in
+`/var/cache/s3fs` and allows all users of the local machine to use
+the mount.
 
 You should now be able to use it like a normal file system, subject
 to some limitations discussed below.
@@ -179,12 +184,35 @@ about updating it. Since this all happens in the local cache, you
 do not save much, but you do incur the cost of downloading it. When
 it transfers a whole file, it just deletes the old version.
 
-Beware that S3's "eventually consistent" semantics can lead to some
-weird behavior. `rsync` will sometimes report a file vanishing and
-other problems. Wait 30 seconds or so and try again, and the problem
-will usually fix itself. As an example, sometimes when you delete a
-file it still shows up in directory listings, but reports a "File
-not Found" error when you try to access it.
+For example, I typically set it up so that the directory I want to
+upload has the same name as the mount point, say `myname`. If the
+source is `~/myname` and the mount point is `/mnt/myname`, then I
+use a command like this:
+
+    rsync -avW --delete ~/myname /mnt/
+
+The `--delete` option tells it to delete files in the target that
+are not in the source, so be careful with this option. An
+alternative is this:
+
+    rsync -avW --delete ~/myname/ /mnt/myname/
+
+Beware that this means something slightly different. This syncs all
+of the files in `/myname/`, but does not sync the directory itself.
+As a result, files missing from `~/myname/` will not be deleted from
+`/mnt/myname/`.
+
+S3's "eventually consistent" semantics can lead to some weird
+behavior. `rsync` will sometimes report a file vanishing and other
+problems. Wait 30 seconds or so and try again, and the problem will
+usually fix itself. As an example, sometimes when you delete a file
+it still shows up in directory listings, but reports a "File not
+Found" error when you try to access it. This also happens frequently
+when you do a `rm -r` over a medium to large directory structure. It
+correctly deletes the files, then fails to delete the directory.
+This is because S3 is still reporting the odd file as existing in a
+directory listing, but it has already been deleted. Wait for a few
+tens of seconds and it should fix itself.
 
 `rsync` is nice because you can just repeat the command and it will
 only worry about the things that did not work the first time.  With
@@ -255,6 +283,35 @@ the commands to install everything you need are given in the quick
 start guide. For other users, use your packaging system to install
 the necessary dependencies. Most compiler errors are due to missing
 libraries.
+
+
+Debugging
+---------
+
+s3fslite logs error and status messages to `/var/log/syslog`. To
+make it display more messages, you can enable some debug flags:
+
+*   `DEBUG` logs each VFS call that is made, e.g., `getattr`,
+    `readdir`, `open`, `read`, `write`, etc.
+
+*   `DEBUG_WIRE` logs each time it contacts S3. This can be useful
+    for seeing how well the cache is working.
+
+*   `DEBUG_CACHE` logs information about the writeback cache. This
+    is fairly chatty output.
+
+All of these messages go to `/var/log/syslog`, so open a terminal
+and run:
+
+    tail -f /var/log/syslog
+
+To enable these flags, add the following to the `CPPFLAGS` line in
+the `Makefile`:
+
+    -DDEBUG -DDEBUG_WIRE -DDEBUG_CACHE
+
+Then do a `make clean` and another `make` and `make install` to
+rebuild it with the caching options.
 
 
 Known Issues:
