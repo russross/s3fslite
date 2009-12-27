@@ -169,8 +169,7 @@ and unmount it using:
 
     sudo umount <mountpoint>
 
-You can also set it to automatically mount at boot time. See
-`man fstab` for details.
+This will also cause it to automatically mount at boot time.
 
 
 Using `rsync`
