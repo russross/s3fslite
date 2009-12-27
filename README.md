@@ -13,68 +13,6 @@ This fork is intended to work better when using `rsync` to copy data
 to an S3 mount.
 
 
-Changes from s3fs
------------------
-
-This fork has the following changes:
-
-*   S3fslite has a writeback cache that holds open files and files
-    that were closed within the last few seconds. This absorbs many
-    of the requests that otherwise take a round-trip each to S3. For
-    example, when `rsync` creates a file, it creates it with a
-    temporary name, writes the data, sets the mode, sets the owner,
-    sets the times, and then moves it over to its permanent name.
-    Without the writeback cache, each of these operations requires a
-    round trip to the server. With it, everything happens locally
-    until the final version is uploaded with all of its metadata.
-
-    To force a sync, do an `ls` in any directory. The `readdir` call
-    does a complete sync before retrieving the directory listing.
-
-*   File metadata is cached in a SQLite database for faster access.
-    File systems do lots of `getattr` calls, and each one normally
-    requires a HEAD request to S3. Caching them locally improves
-    performance a lot and reduces the number (and hence cost) of
-    requests to Amazon.
-
-    The original s3fs has the beginnings of in-memory stat caching,
-    but it does not persist across mounts. For large file systems,
-    losing the entire cache on a restart is costly.
-
-*   `readdir` requests do *not* send off file attribute requests.
-    The original code effectively issues a `getattr` request to S3
-    for each file when directories are listed. The cache was not
-    consulted, but the results were put in the cache.
-
-    This behavior made listing directories ridiculously slow. It
-    appears to have been an attempt to optimize (by priming the
-    cache) that backfired. It wouldn't be the first time that a
-    cache optimization has made things slower overall.
-
-*   The MIME type of files is reset when files are renamed. This
-    fixes a bug in s3fs that is particularly devastating for `rsync`
-    users. `rsync` always writes to a temporary file, then renames
-    it to the target name. Without this fix, MIME types were rarely
-    correct, which confused browsers when looking at static content
-    on an S3 archive.
-
-*   By default, ACLs are set based on the file permission. If the
-    file is publicly readable, the "public-read" ACL is used, which
-    permits anyone to read the file (including web browsers). If
-    not, it defaults to "private", which denies access to public
-    browsers. Setting the `default_acl` option overrides this, and
-    sets everything to the specified ACL.
-
-*   MD5 sums are computed for all uploads and downloads. S3 provides
-    MD5 hash values on downloads, and verifies them on the received
-    data for uploads, ensuring that no data is corrupted in transit.
-
-*   The `use_cache` option has been removed. An on-disk cache is not
-    currently supported, except for the short-term writeback cache.
-    For AFS-style caching (which is more-or-less what s3fs uses), a
-    seperate caching layer would be more appropriate.
-
-
 Quick start
 ===========
 
@@ -172,6 +110,35 @@ and unmount it using:
 This will also cause it to automatically mount at boot time.
 
 
+Attribute cache
+---------------
+
+If the attribute cache ever gets out of sync, simply delete the
+database file. This is `/var/cache/s3fs/<bucketname>.sqlite` if you
+set things up as recommended. If you are accessing a single bucket
+from multiple machines, you must manage the cache yourself. You can
+either delete the file each time you switch machines, or you can
+copy it over. If you do the latter, you should unmount the bucket
+before copying the file, and before copying it into its new
+location. You should only have a bucket mounted from one place at a
+time.
+
+The database file compresses very nicely; compressing it and copying
+it to another location (then decompressing it) is a viable solution.
+
+When starting from a cold cache, you can just start using the system
+and it will gradually build the cache up. If you are using it
+interactively, it will be really slow at first, so I recommend
+priming the cache first. Just do:
+
+    find /mnt/myfilesystem
+
+and go do something else while it runs. This will scan the entire
+mount and load the attributes for every file into the cache. From
+that point forward, using it interactively should be much more
+pleasant.
+
+
 Using `rsync`
 -------------
 
@@ -249,6 +216,68 @@ The complete list of supported options is:
 *   `attr_cache=` specify the directory where the attribute cache
     database should be created and accessed (default current
     directory)
+
+
+Changes from s3fs
+-----------------
+
+This fork has the following changes:
+
+*   S3fslite has a writeback cache that holds open files and files
+    that were closed within the last few seconds. This absorbs many
+    of the requests that otherwise take a round-trip each to S3. For
+    example, when `rsync` creates a file, it creates it with a
+    temporary name, writes the data, sets the mode, sets the owner,
+    sets the times, and then moves it over to its permanent name.
+    Without the writeback cache, each of these operations requires a
+    round trip to the server. With it, everything happens locally
+    until the final version is uploaded with all of its metadata.
+
+    To force a sync, do an `ls` in any directory. The `readdir` call
+    does a complete sync before retrieving the directory listing.
+
+*   File metadata is cached in a SQLite database for faster access.
+    File systems do lots of `getattr` calls, and each one normally
+    requires a HEAD request to S3. Caching them locally improves
+    performance a lot and reduces the number (and hence cost) of
+    requests to Amazon.
+
+    The original s3fs has the beginnings of in-memory stat caching,
+    but it does not persist across mounts. For large file systems,
+    losing the entire cache on a restart is costly.
+
+*   `readdir` requests do *not* send off file attribute requests.
+    The original code effectively issues a `getattr` request to S3
+    for each file when directories are listed. The cache was not
+    consulted, but the results were put in the cache.
+
+    This behavior made listing directories ridiculously slow. It
+    appears to have been an attempt to optimize (by priming the
+    cache) that backfired. It wouldn't be the first time that a
+    cache optimization has made things slower overall.
+
+*   The MIME type of files is reset when files are renamed. This
+    fixes a bug in s3fs that is particularly devastating for `rsync`
+    users. `rsync` always writes to a temporary file, then renames
+    it to the target name. Without this fix, MIME types were rarely
+    correct, which confused browsers when looking at static content
+    on an S3 archive.
+
+*   By default, ACLs are set based on the file permission. If the
+    file is publicly readable, the "public-read" ACL is used, which
+    permits anyone to read the file (including web browsers). If
+    not, it defaults to "private", which denies access to public
+    browsers. Setting the `default_acl` option overrides this, and
+    sets everything to the specified ACL.
+
+*   MD5 sums are computed for all uploads and downloads. S3 provides
+    MD5 hash values on downloads, and verifies them on the received
+    data for uploads, ensuring that no data is corrupted in transit.
+
+*   The `use_cache` option has been removed. An on-disk cache is not
+    currently supported, except for the short-term writeback cache.
+    For AFS-style caching (which is more-or-less what s3fs uses), a
+    seperate caching layer would be more appropriate.
 
 
 Dependencies
