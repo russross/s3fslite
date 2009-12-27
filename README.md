@@ -18,6 +18,19 @@ Changes from s3fs
 
 This fork has the following changes:
 
+*   S3fslite has a writeback cache that holds open files and files
+    that were closed within the last few seconds. This absorbs many
+    of the requests that otherwise take a round-trip each to S3. For
+    example, when `rsync` creates a file, it creates it with a
+    temporary name, writes the data, sets the mode, sets the owner,
+    sets the times, and then moves it over to its permanent name.
+    Without the writeback cache, each of these operations requires a
+    round trip to the server. With it, everything happens locally
+    until the final version is uploaded with all of its metadata.
+
+    To force a sync, do an `ls` in any directory. The `readdir` call
+    does a complete sync before retrieving the directory listing.
+
 *   File metadata is cached in a SQLite database for faster access.
     File systems do lots of `getattr` calls, and each one normally
     requires a HEAD request to S3. Caching them locally improves
@@ -49,7 +62,7 @@ This fork has the following changes:
     file is publicly readable, the "public-read" ACL is used, which
     permits anyone to read the file (including web browsers). If
     not, it defaults to "private", which denies access to public
-    browsers. Setting the "default_acl" option overrides this, and
+    browsers. Setting the `default_acl` option overrides this, and
     sets everything to the specified ACL.
 
 *   MD5 sums are computed for all uploads. S3 verifies the checksum
@@ -57,9 +70,9 @@ This fork has the following changes:
     transit (at least not during uploads).
 
 *   The `use_cache` option has been removed. An on-disk cache is not
-    currently supported. I intend to implement a different caching
-    strategy. For AFS-style caching (which is more-or-less what s3fs
-    uses), a seperate caching layer would be more appropriate.
+    currently supported, except for the short-term writeback cache.
+    For AFS-style caching (which is more-or-less what s3fs uses), a
+    seperate caching layer would be more appropriate.
 
 
 Quick start
@@ -155,6 +168,31 @@ You can also set it to automatically mount at boot time. See
 `man fstab` for details.
 
 
+Using `rsync`
+-------------
+
+When using `rsync` to upload data, I recommend using the `-a` option
+(to sync file times, do recursive uploads, etc.) and the `-W`
+option. `-W` instructs it to always copy whole files. Without it,
+`rsync` will download the old version of a file and try to be clever
+about updating it. Since this all happens in the local cache, you
+do not save much, but you do incur the cost of downloading it. When
+it transfers a whole file, it just deletes the old version.
+
+Beware that S3's "eventually consistent" semantics can lead to some
+weird behavior. `rsync` will sometimes report a file vanishing and
+other problems. Wait 30 seconds or so and try again, and the problem
+will usually fix itself. As an example, sometimes when you delete a
+file it still shows up in directory listings, but reports a "File
+not Found" error when you try to access it.
+
+`rsync` is nice because you can just repeat the command and it will
+only worry about the things that did not work the first time.  With
+the attribute cache, only a few requests are necessary (to look up
+directory listings), so repeated `rsync` operations are pretty
+cheap.
+
+
 Details
 =======
 
@@ -229,11 +267,6 @@ couple of limitations:
     "`root`" and if you allow others to access the bucket, others
     can erase files. There is, however, permissions support built
     in.
-
-*   Currently s3fs could hang the CPU if you have lots of time-outs.
-    This is *not* a fault of s3fs but rather `libcurl`. This
-    happends when you try to copy thousands of files in 1 session,
-    it doesn't happend when you upload hundreds of files or less.
 
 *   CentOS 4.x/RHEL 4.x users: if you use the kernel that shipped
     with your distribution and didn't upgrade to the latest kernel
