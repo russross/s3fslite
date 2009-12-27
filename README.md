@@ -342,6 +342,56 @@ Then do a `make clean` and another `make` and `make install` to
 rebuild it with the caching options.
 
 
+The writeback cache
+-------------------
+
+When a file is opened, it is transferred from S3 to a local file.
+This is created in `/tmp` and immediately unlinked, so it is not
+visible in the file system and will automatically be deleted when
+closed (or if the program crashes).
+
+All read/write operations take place on the cached copy of the file.
+It is held in the cache and not synchronized with the server (except
+in some special cases discussed below) until the file is closed and
+has not been touched for 5 seconds. Metadata updates reset the
+clock, so `chmod` and `chown` operations keep the item cached as
+well.
+
+A file is normally only flushed to the server when it is closed and
+has been idle for 5 seconds. This covers file renames and deletes as
+well. This is designed for `rsync`, which writes the data to a
+temporary file, then sets its mode, ownership, and times, then
+renames it to its final name. All of this happens in the cache, and
+the final version of the file complete with metadata is pushed to
+the server in one transfer.
+
+`readdir` operations are never cached, so they have the potential to
+pierce the abstraction and observe unsynced operations. To prevent
+this, *all* files in the cache are synced before a `readdir`
+operation. This is the simplest way to force a sync and make sure
+all of the data has been written out: just run `ls` in any directory
+inside the mounted file system. `rmdir` operations also force a sync
+for the same reason; non-empty directories cannot be removed, so a
+sync is performed first to make sure any recent deletes have been
+pushed to the server.
+
+All of this means that operations (like `rsync`) will often be very
+fast for the first 5 seconds or so, and then suddenly slow down. The
+whole server uses a big ol' lock for synchronization, so only a
+single operation can be happening at once. When the thread that
+flushes the cache obtains the lock, it holds on to it until the
+cache has been cleared (to the 5 second limit). This means that
+while it is catching up, nothing else happens, preventing the
+backlog from getting too long.
+
+As a result, the server is usually within about 10 or 20 seconds of
+being current with the cache. A sync is also forced when the file
+system shuts down normally.
+
+To observe how all of this works, enable all of the debugging logs
+(see the "Debugging" section).
+
+
 Known Issues:
 -------------
 
@@ -360,6 +410,10 @@ couple of limitations:
     above) and make sure "`fuse`" kernel module is compiled and
     loadable since FUSE requires this kernel module and s3fs
     requires it as well.
+
+*   You cannot rename directories. Doing so will require doing a
+    deep move of everything in the directory. This is on my TODO
+    list, but it has not happened yet.
 
 
 License:
