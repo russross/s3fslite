@@ -213,15 +213,9 @@ void Transaction::getPair(std::string src, std::string tgt) {
     if (src == "/" || tgt == "/")
         throw -ENOTSUP;
 
-    // acquire the locks in alphabetical order to prevent deadlocks
     path = src;
-    if (src < tgt) {
-        file = Openfile::get(src);
-        target = Openfile::get(tgt);
-    } else {
-        target = Openfile::get(tgt);
-        file = Openfile::get(src);
-    }
+    file = Openfile::get(src);
+    target = Openfile::get(tgt);
 
     // fail if either file is currently open
     if (file->opencount > 0 || target->opencount > 0)
@@ -288,6 +282,10 @@ void Transaction::getFd() {
 void *flush_loop(void *param) {
     pthread_mutex_lock(&lock);
 
+    // once we get the lock, we hold on to it until the queue is clear
+    // this prevents other transactions from happening, which prevents
+    // the backlog from getting too big.  we only release the lock when
+    // we are ready to sleep
     while (!flush_shutdown) {
         Openfile *file = Openfile::from_queue();
         if (file) {
