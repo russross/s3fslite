@@ -104,6 +104,19 @@ unsigned long long longnum(std::string value) {
     return strtoull(value.c_str(), NULL, 10);
 }
 
+int create_tempfile() {
+    char localname[32];
+    strcpy(localname, "/tmp/s3fs.XXXXXX");
+    int fd = mkstemp(localname);
+    if (fd < 0)
+        throw -errno;
+    if (unlink(localname) < 0) {
+        close(fd);
+        throw -errno;
+    }
+    return fd;
+}
+
 class Transaction {
     private:
         bool havelock;
@@ -497,11 +510,16 @@ Openfile *rename_file(std::string from, std::string to, bool toplevel) {
     // note: getPair sets source info, clears target info and fd
     t.getPair(from, to);
 
+    bool isdir = t.file->info->mode & S_IFDIR;
+
+    // if it is a directory with open files, fail
+    if (toplevel && isdir && Openfile::openfiles(from + "/"))
+        throw -EBUSY;
+
     // move the metadata over
     t.target->info = t.file->info;
     t.target->info->path = to;
 
-    bool isdir = t.file->info->mode & S_IFDIR;
     t.file->info = NULL;
 
     if (isdir && t.file->fd >= 0) {

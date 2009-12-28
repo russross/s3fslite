@@ -29,4 +29,5 @@ class Openfile {
         static Openfile *from_queue();
         void fsync();
         static void sync();
+        static bool openfiles(std::string prefix);
 };

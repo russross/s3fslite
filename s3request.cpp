@@ -54,6 +54,96 @@ std::string getAcl(mode_t mode) {
     return private_acl;
 }
 
+std::string base64_encode(unsigned char *md, unsigned md_len) {
+    BIO *b64 = BIO_new(BIO_f_base64());
+    BIO *bmem = BIO_new(BIO_s_mem());
+    b64 = BIO_push(b64, bmem);
+    BIO_write(b64, md, md_len);
+
+    // (void) is to silence a warning
+    (void) BIO_flush(b64);
+    BUF_MEM *bptr;
+    BIO_get_mem_ptr(b64, &bptr);
+
+    std::string result;
+    result.resize(bptr->length - 1);
+    memcpy(&result[0], bptr->data, bptr->length-1);
+
+    BIO_free_all(b64);
+
+    return result;
+}
+
+class CalcMD5 {
+    private:
+        MD5_CTX context;
+        unsigned char digest[MD5_DIGEST_LENGTH];
+        bool finalized;
+
+    public:
+        CalcMD5();
+        void add(unsigned char *buf, int count);
+        void addFile(int fd);
+        std::string getHex();
+        std::string getBase64();
+};
+
+CalcMD5::CalcMD5() {
+    if (MD5_Init(&context) != 1)
+        throw -EIO;
+    finalized = false;
+}
+
+void CalcMD5::add(unsigned char *buf, int count) {
+    if (MD5_Update(&context, buf, count) != 1)
+        throw -EIO;
+}
+
+void CalcMD5::addFile(int fd) {
+    lseek(fd, 0, SEEK_SET);
+
+    int count;
+    unsigned char buf[4096];
+    while ((count = read(fd, buf, sizeof(buf))) > 0)
+        add(buf, count);
+}
+
+std::string CalcMD5::getHex() {
+    if (!finalized) {
+        if (MD5_Final(digest, &context) != 1)
+            throw -EIO;
+        finalized = true;
+    }
+
+    char localMd5[2 * MD5_DIGEST_LENGTH + 1];
+    sprintf(localMd5,
+            "%02x%02x%02x%02x%02x%02x%02x%02x"
+            "%02x%02x%02x%02x%02x%02x%02x%02x",
+            digest[0], digest[1], digest[2], digest[3],
+            digest[4], digest[5], digest[6], digest[7],
+            digest[8], digest[9], digest[10], digest[11],
+            digest[12], digest[13], digest[14], digest[15]);
+
+    std::string sum(localMd5);
+    return sum;
+}
+
+std::string CalcMD5::getBase64() {
+    if (!finalized) {
+        if (MD5_Final(digest, &context) != 1)
+            throw -EIO;
+        finalized = true;
+    }
+
+    return base64_encode(digest, MD5_DIGEST_LENGTH);
+}
+
+class Download : public CalcMD5 {
+    public:
+        int fd;
+};
+
+
 // gather headers as a response is parsed
 static size_t header_callback(void *data, size_t blockSize, size_t numBlocks,
         void *userPtr)
@@ -70,19 +160,28 @@ static size_t header_callback(void *data, size_t blockSize, size_t numBlocks,
     return blockSize * numBlocks;
 }
 
-// libcurl callback
-size_t readCallback(void *data, size_t blockSize, size_t numBlocks,
+// read data from a fd
+size_t uploadCallback(void *data, size_t blockSize, size_t numBlocks,
         void *userPtr)
 {
-    std::string *userString = static_cast<std::string *>(userPtr);
-    size_t count = std::min((*userString).size(), blockSize * numBlocks);
-    memcpy(data, (*userString).data(), count);
-    (*userString).erase(0, count);
-    return count;
+    int *fd = static_cast<int *>(userPtr);
+    return read(*fd, data, blockSize * numBlocks);
 }
 
-// libcurl callback
-size_t writeCallback(void* data, size_t blockSize, size_t numBlocks,
+// store data in a fd and compute the md5 on the fly
+size_t downloadCallback(void *data, size_t blockSize, size_t numBlocks,
+        void *userPtr)
+{
+    Download *file = static_cast<Download *>(userPtr);
+
+    // update the md5 sum
+    file->add(static_cast<unsigned char *>(data), blockSize * numBlocks);
+
+    return write(file->fd, data, blockSize * numBlocks);
+}
+
+// store received data in a string
+size_t writeToStringCallback(void* data, size_t blockSize, size_t numBlocks,
         void *userPtr)
 {
     std::string *userString = static_cast<std::string *>(userPtr);
@@ -149,79 +248,6 @@ std::string get_date() {
     time_t t = time(NULL);
     strftime(buf, sizeof(buf), "%a, %d %b %Y %H:%M:%S GMT", gmtime(&t));
     return buf;
-}
-
-int create_tempfile() {
-    char localname[32];
-    strcpy(localname, "/tmp/s3fs.XXXXXX");
-    int fd = mkstemp(localname);
-    if (fd < 0)
-        throw -errno;
-    if (unlink(localname) < 0) {
-        close(fd);
-        throw -errno;
-    }
-    return fd;
-}
-
-// note: returns a buffer that must be delete[]ed
-unsigned char *get_md5(int fd) {
-    MD5_CTX c;
-    if (MD5_Init(&c) != 1)
-        throw -EIO;
-
-    // start reading the file from the beginning
-    lseek(fd, 0, SEEK_SET);
-
-    int count;
-    char buf[4096];
-    while ((count = read(fd, buf, sizeof(buf))) > 0) {
-        if (MD5_Update(&c, buf, count) != 1)
-            throw -EIO;
-    }
-
-    unsigned char *md = new unsigned char[MD5_DIGEST_LENGTH];
-    if (MD5_Final(md, &c) != 1) {
-        delete[] md;
-        throw -EIO;
-    }
-
-    return md;
-}
-
-std::string md5_to_string(unsigned char *md) {
-    char localMd5[2 * MD5_DIGEST_LENGTH + 1];
-    sprintf(localMd5,
-            "%02x%02x%02x%02x%02x%02x%02x%02x"
-            "%02x%02x%02x%02x%02x%02x%02x%02x",
-            md[0], md[1], md[2], md[3],
-            md[4], md[5], md[6], md[7],
-            md[8], md[9], md[10], md[11],
-            md[12], md[13], md[14], md[15]);
-
-    std::string sum(localMd5);
-    return sum;
-}
-
-
-std::string base64_encode(unsigned char *md, unsigned md_len) {
-    BIO *b64 = BIO_new(BIO_f_base64());
-    BIO *bmem = BIO_new(BIO_s_mem());
-    b64 = BIO_push(b64, bmem);
-    BIO_write(b64, md, md_len);
-
-    // (void) is to silence a warning
-    (void) BIO_flush(b64);
-    BUF_MEM *bptr;
-    BIO_get_mem_ptr(b64, &bptr);
-
-    std::string result;
-    result.resize(bptr->length - 1);
-    memcpy(&result[0], bptr->data, bptr->length-1);
-
-    BIO_free_all(b64);
-
-    return result;
 }
 
 S3request::S3request(std::string path, std::string query) {
@@ -428,11 +454,6 @@ void S3request::set_fileinfo(std::string path, Fileinfo *info) {
     std::string date = get_date();
 
     S3request req(info->path);
-    std::string response;
-
-    // store the entire response in a string
-    curl_easy_setopt(req.curl, CURLOPT_WRITEDATA, &response);
-    curl_easy_setopt(req.curl, CURLOPT_WRITEFUNCTION, writeCallback);
 
     // CURLOPT_UPLOAD => PUT
     curl_easy_setopt(req.curl, CURLOPT_UPLOAD, true);
@@ -480,22 +501,13 @@ int S3request::get_file(std::string path, Fileinfo *info) {
     curl_easy_setopt(req.curl, CURLOPT_HEADERDATA, &response);
     curl_easy_setopt(req.curl, CURLOPT_HEADERFUNCTION, header_callback);
 
-    int dupfd = dup(fd);
-    if (dupfd < 0) {
-        int err = -errno;
-        close(fd);
-        throw err;
-    }
-    req.fp = fdopen(dupfd, "w+");
-    if (!req.fp) {
-        int err = -errno;
-        close(fd);
-        close(dupfd);
-        throw err;
-    }
-
     // store the response in the temporary file
-    curl_easy_setopt(req.curl, CURLOPT_FILE, req.fp);
+    Download file;
+    file.fd = fd;
+
+    // store the data and compute the md5sum
+    curl_easy_setopt(req.curl, CURLOPT_WRITEDATA, &file);
+    curl_easy_setopt(req.curl, CURLOPT_WRITEFUNCTION, downloadCallback);
 
     // set all the headers
     req.add_header("Date: " + date);
@@ -505,10 +517,7 @@ int S3request::get_file(std::string path, Fileinfo *info) {
 
     // check its md5 sum
     std::string etag = trim_quotes(response["ETag"]);
-    fflush(req.fp);
-    unsigned char *md = get_md5(fd);
-    std::string md5sum = md5_to_string(md);
-    delete[] md;
+    std::string md5sum = file.getHex();
 
     if (md5sum != etag) {
         // file corrupted during download
@@ -517,8 +526,6 @@ int S3request::get_file(std::string path, Fileinfo *info) {
         close(fd);
         throw -EIO;
     }
-
-    // the FILE * and dupfd will be closed when req is deleted
 
     return fd;
 }
@@ -536,11 +543,6 @@ void S3request::put_file(Fileinfo *info, int fd) {
     std::string date = get_date();
 
     S3request req(info->path);
-    std::string response;
-
-    // store the entire response in a string
-    curl_easy_setopt(req.curl, CURLOPT_WRITEDATA, &response);
-    curl_easy_setopt(req.curl, CURLOPT_WRITEFUNCTION, writeCallback);
 
     // CURLOPT_UPLOAD => PUT
     curl_easy_setopt(req.curl, CURLOPT_UPLOAD, true);
@@ -553,28 +555,20 @@ void S3request::put_file(Fileinfo *info, int fd) {
         curl_easy_setopt(req.curl, CURLOPT_INFILESIZE, 0);
     } else {
         // set it up to upload from a file descriptor
-        unsigned char *md = get_md5(fd);
-        md5sum = base64_encode(md, MD5_DIGEST_LENGTH);
-        delete[] md;
+        CalcMD5 md5;
+        md5.addFile(fd);
+        md5sum = md5.getBase64();
 
         // CURLOPT_INFILESIZE_LARGE == Content-Length
         curl_easy_setopt(req.curl, CURLOPT_INFILESIZE_LARGE,
                 static_cast<curl_off_t>(info->size));
 
-        // dup the file descriptor and make a FILE * out of it
+        // start reading from the beginning of the file
         lseek(fd, 0, SEEK_SET);
-        int dupfd = dup(fd);
-        if (dupfd < 0)
-            throw -errno;
 
-        req.fp = fdopen(dupfd, "rb");
-        if (!req.fp) {
-            close(dupfd);
-            throw -errno;
-        }
-
-        // read the contents from an open FILE *
-        curl_easy_setopt(req.curl, CURLOPT_INFILE, req.fp);
+        // store the data and compute the md5sum
+        curl_easy_setopt(req.curl, CURLOPT_READDATA, &fd);
+        curl_easy_setopt(req.curl, CURLOPT_READFUNCTION, uploadCallback);
     }
 
     // set all the headers
@@ -607,11 +601,6 @@ void S3request::remove(std::string path) {
     std::string date = get_date();
 
     S3request req(path);
-    std::string response;
-
-    // store the entire response in a string
-    curl_easy_setopt(req.curl, CURLOPT_WRITEDATA, &response);
-    curl_easy_setopt(req.curl, CURLOPT_WRITEFUNCTION, writeCallback);
 
     // DELETE request
     curl_easy_setopt(req.curl, CURLOPT_CUSTOMREQUEST, "DELETE");
@@ -656,7 +645,7 @@ bool S3request::get_directory(std::string path, std::string &marker,
 
     // store the entire response in a string
     curl_easy_setopt(req.curl, CURLOPT_WRITEDATA, &response);
-    curl_easy_setopt(req.curl, CURLOPT_WRITEFUNCTION, writeCallback);
+    curl_easy_setopt(req.curl, CURLOPT_WRITEFUNCTION, writeToStringCallback);
 
     // set all the headers
     req.add_header("Date: " + date);

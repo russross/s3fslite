@@ -228,3 +228,27 @@ void Openfile::sync() {
         it->second->fsync();
     }
 }
+
+// return true if any files are currently open with the given prefix
+bool Openfile::openfiles(std::string prefix) {
+#ifdef DEBUG_CACHE
+    syslog(LOG_INFO, "Openfile::openfiles checking for prefix[%s]",
+            prefix.c_str());
+#endif
+
+    for (std::map<std::string, Openfile *>::iterator
+            it = open_files.begin();
+            it != open_files.end();
+            it++)
+    {
+        Openfile *file = it->second;
+        if (file->path.length() >= prefix.length() &&
+                file->path.compare(0, prefix.length(), prefix) == 0 &&
+                file->opencount > 0)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}

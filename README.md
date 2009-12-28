@@ -252,6 +252,9 @@ This fork has the following changes:
     by downloading them and re-uploading them, the same as for
     metadata updates, regular renames, and links.
 
+    Directories with open files (this includes any descendents)
+    cannot be renamed. Open files cannot be renamed either.
+
 *   `readdir` requests do *not* send off file attribute requests.
     The original code effectively issues a `getattr` request to S3
     for each file when directories are listed. The cache was not
