@@ -5,8 +5,6 @@
 #include <queue>
 #include <vector>
 
-#define CACHE_TIMEOUT 5
-
 class Openfile {
     public:
         std::string path;

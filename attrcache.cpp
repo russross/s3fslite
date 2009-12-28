@@ -7,6 +7,7 @@
 
 #include "fileinfo.h"
 #include "attrcache.h"
+#include "s3fs.h"
 
 //
 // SQLite attribute caching
@@ -82,11 +83,11 @@ Fileinfo *Attrcache::get(std::string path) {
     // get the data from the second row
     Fileinfo *result = new Fileinfo(
             path,
-            strtoul(data[5], NULL, 10), // uid
-            strtoul(data[6], NULL, 10), // gid
-            strtoul(data[7], NULL, 10), // mode
-            strtoul(data[8], NULL, 10), // mtime
-            strtoul(data[9], NULL, 10)); // size
+            num(data[5]), // uid
+            num(data[6]), // gid
+            num(data[7]), // mode
+            num(data[8]), // mtime
+            num(data[9])); // size
     sqlite3_free_table(data);
 
     return result;

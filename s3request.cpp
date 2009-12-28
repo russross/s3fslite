@@ -29,14 +29,6 @@ std::string str(T value) {
     return tmp.str();
 }
 
-static inline unsigned long num(std::string value) {
-    return strtoul(value.c_str(), NULL, 10);
-}
-
-static inline unsigned long long longnum(std::string value) {
-    return strtoull(value.c_str(), NULL, 10);
-}
-
 /**
  * @param s e.g., "index.html"
  * @return e.g., "text/html"

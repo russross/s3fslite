@@ -51,23 +51,21 @@
 #include "openfile.h"
 #include "s3fs.h"
 
-using namespace std;
-
 // config parameters
-string bucket;
-string AWSAccessKeyId;
-string AWSSecretAccessKey;
-string host("http://s3.amazonaws.com");
+std::string bucket;
+std::string AWSAccessKeyId;
+std::string AWSSecretAccessKey;
+std::string host("http://s3.amazonaws.com");
 mode_t root_mode = 0755;
-string attr_cache;
+std::string attr_cache;
 int retries = 2;
 long connect_timeout = 2;
 time_t readwrite_timeout = 10;
 
 // private, public-read, public-read-write, authenticated-read
-string default_acl;
-string private_acl("private");
-string public_acl("public-read");
+std::string default_acl;
+std::string private_acl("private");
+std::string public_acl("public-read");
 
 Attrcache *attrcache;
 
@@ -83,19 +81,27 @@ static std::string SPACES(" \t\r\n");
 static std::string QUOTES("\"");
 
 std::string trim_spaces(const std::string &s) {
-    string::size_type start(s.find_first_not_of(SPACES));
-    string::size_type end(s.find_last_not_of(SPACES));
-    if (start == string::npos || end == string::npos)
+    std::string::size_type start(s.find_first_not_of(SPACES));
+    std::string::size_type end(s.find_last_not_of(SPACES));
+    if (start == std::string::npos || end == std::string::npos)
         return "";
     return s.substr(start, end + 1 - start);
 }
 
 std::string trim_quotes(const std::string &s) {
-    string::size_type start(s.find_first_not_of(QUOTES));
-    string::size_type end(s.find_last_not_of(QUOTES));
-    if (start == string::npos || end == string::npos)
+    std::string::size_type start(s.find_first_not_of(QUOTES));
+    std::string::size_type end(s.find_last_not_of(QUOTES));
+    if (start == std::string::npos || end == std::string::npos)
         return "";
     return s.substr(start, end + 1 - start);
+}
+
+unsigned long num(std::string value) {
+    return strtoul(value.c_str(), NULL, 10);
+}
+
+unsigned long long longnum(std::string value) {
+    return strtoull(value.c_str(), NULL, 10);
 }
 
 class Transaction {
@@ -470,7 +476,7 @@ int s3fs_rmdir(const char *path) {
         Openfile::sync();
 
         // make sure the directory is empty
-        string marker;
+        std::string marker;
         stringlist entries;
         S3request::get_directory(path, marker, entries, 1);
         if (entries.size() > 0)
@@ -562,7 +568,7 @@ int s3fs_rename(const char *from, const char *to) {
             // this is a directory, so rename all descendents
             Openfile::sync();
 
-            string marker;
+            std::string marker;
             bool moretocome = true;
 
             while (moretocome) {
@@ -571,9 +577,9 @@ int s3fs_rename(const char *from, const char *to) {
                         MAX_KEYS_PER_DIR_REQUEST, true);
 
                 for (size_t i = 0; i < entries.size(); i++) {
-                    string src(from);
+                    std::string src(from);
                     src += "/" + entries[i];
-                    string tgt(to);
+                    std::string tgt(to);
                     tgt += "/" + entries[i];
 
 #ifdef DEBUG
@@ -876,7 +882,7 @@ int s3fs_readdir(const char *path, void *buf,
         filler(buf, ".", 0, 0);
         filler(buf, "..", 0, 0);
 
-        string marker;
+        std::string marker;
         bool moretocome = true;
 
         while (moretocome) {
@@ -907,23 +913,6 @@ void *s3fs_init(struct fuse_conn_info *conn) {
 
     // openssl
     curl_global_init(CURL_GLOBAL_ALL);
-
-    string line;
-    ifstream passwd("/etc/mime.types");
-    while (getline(passwd, line)) {
-        if (line[0] == '#')
-            continue;
-        stringstream tmp(line);
-        string mimeType;
-        tmp >> mimeType;
-        while (tmp) {
-            string ext;
-            tmp >> ext;
-            if (ext.size() == 0)
-                continue;
-            mimeTypes[ext] = mimeType;
-        }
-    }
 
     flush_shutdown = false;
     pthread_create(&flush_thread, NULL,
@@ -990,11 +979,11 @@ int my_fuse_opt_proc(void *data, const char *arg,
             return 0;
         }
         if (strstr(arg, "connect_timeout=") != 0) {
-            connect_timeout = strtol(strchr(arg, '=') + 1, 0, 10);
+            connect_timeout = num(strchr(arg, '=') + 1);
             return 0;
         }
         if (strstr(arg, "readwrite_timeout=") != 0) {
-            readwrite_timeout = strtoul(strchr(arg, '=') + 1, 0, 10);
+            readwrite_timeout = num(strchr(arg, '=') + 1);
             return 0;
         }
         if (strstr(arg, "url=") != 0) {
@@ -1018,38 +1007,40 @@ int main(int argc, char *argv[]) {
     fuse_opt_parse(&custom_args, NULL, NULL, my_fuse_opt_proc);
 
     if (bucket.size() == 0) {
-        cout << argv[0] << ": " << "missing bucket" << endl;
+        std::cout << argv[0] << ": " << "missing bucket" << std::endl;
         exit(1);
     }
 
     if (AWSSecretAccessKey.size() == 0) {
-        string line;
-        ifstream passwd("/etc/passwd-s3fs");
+        std::string line;
+        std::ifstream passwd("/etc/passwd-s3fs");
         while (getline(passwd, line)) {
             if (line[0]=='#')
                 continue;
             size_t pos = line.find(':');
-            if (pos != string::npos) {
+            if (pos != std::string::npos) {
                 // is accessKeyId missing?
                 if (AWSAccessKeyId.size() == 0)
                     AWSAccessKeyId = line.substr(0, pos);
                 // is secretAccessKey missing?
                 if (AWSSecretAccessKey.size() == 0) {
                     if (line.substr(0, pos) == AWSAccessKeyId)
-                        AWSSecretAccessKey = line.substr(pos + 1, string::npos);
+                        AWSSecretAccessKey =
+                            line.substr(pos + 1, std::string::npos);
                 }
             }
         }
     }
 
     if (AWSAccessKeyId.size() == 0) {
-        cout << argv[0] << ": " << "missing accessKeyId.. see "
-            "/etc/passwd-s3fs or use, e.g., -o accessKeyId=aaa" << endl;
+        std::cout << argv[0] << ": " << "missing accessKeyId.. see "
+            "/etc/passwd-s3fs or use, e.g., -o accessKeyId=aaa" << std::endl;
         exit(1);
     }
     if (AWSSecretAccessKey.size() == 0) {
-        cout << argv[0] << ": " << "missing secretAccessKey... see "
-            "/etc/passwd-s3fs or use, e.g., -o secretAccessKey=bbb" << endl;
+        std::cout << argv[0] << ": " << "missing secretAccessKey... see "
+            "/etc/passwd-s3fs or use, e.g., -o secretAccessKey=bbb" <<
+            std::endl;
         exit(1);
     }
 
@@ -1075,6 +1066,24 @@ int main(int argc, char *argv[]) {
     s3fs_oper.init = s3fs_init;
     s3fs_oper.destroy = s3fs_destroy;
     s3fs_oper.utimens = s3fs_utimens;
+
+    // load the list of mime types
+    std::string line;
+    std::ifstream passwd("/etc/mime.types");
+    while (getline(passwd, line)) {
+        if (line[0] == '#')
+            continue;
+        std::stringstream tmp(line);
+        std::string mimeType;
+        tmp >> mimeType;
+        while (tmp) {
+            std::string ext;
+            tmp >> ext;
+            if (ext.size() == 0)
+                continue;
+            mimeTypes[ext] = mimeType;
+        }
+    }
 
     attrcache = new Attrcache(bucket, attr_cache);
 

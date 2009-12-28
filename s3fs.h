@@ -1,14 +1,22 @@
 #pragma once
 
 #include <string>
+#include <map>
+#include <vector>
+#include <string.h>
 #include <time.h>
 #include <fcntl.h>
 
 #define DEFAULT_MIME_TYPE "application/octet-stream"
 #define DIRECTORY_MIME_TYPE "application/x-directory"
+#define MAX_KEYS_PER_DIR_REQUEST 200
+#define CACHE_TIMEOUT 5
 
 std::string trim_spaces(const std::string &s);
 std::string trim_quotes(const std::string &s);
+unsigned long num(std::string value);
+unsigned long long longnum(std::string value);
+int create_tempfile();
 
 class cmp_ignore_case {
     public:
@@ -18,6 +26,8 @@ class cmp_ignore_case {
 };
 
 typedef std::map<std::string, std::string, cmp_ignore_case> mimes_t;
+typedef std::vector<std::string> stringlist;
+
 extern mimes_t mimeTypes;
 extern time_t readwrite_timeout;
 extern long connect_timeout;

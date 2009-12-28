@@ -6,17 +6,7 @@
 #include <curl/curl.h>
 
 #include "fileinfo.h"
-
-#define MAX_KEYS_PER_DIR_REQUEST 200
-typedef std::vector<std::string> stringlist;
-
-int create_tempfile();
-
-#define failif(e) do { \
-    int result = (e); \
-    if (result != 0) \
-        throw result; \
-} while (0)
+#include "s3fs.h"
 
 class S3request {
     private:
