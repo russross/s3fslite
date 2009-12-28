@@ -223,14 +223,14 @@ Changes from s3fs
 
 This fork has the following changes:
 
-*   S3fslite has a writeback cache that holds open files and files
+*   S3fslite has a write-back cache that holds open files and files
     that were closed within the last few seconds. This absorbs many
     of the requests that otherwise take a round-trip each to S3. For
     example, when `rsync` creates a file, it creates it with a
     temporary name, writes the data, sets the mode, sets the owner,
     sets the times, and then moves it over to its permanent name.
-    Without the writeback cache, each of these operations requires a
-    round trip to the server. With it, everything happens locally
+    Without the write-back cache, each of these operations requires
+    a round trip to the server. With it, everything happens locally
     until the final version is uploaded with all of its metadata.
 
     To force a sync, do an `ls` in any directory. The `readdir` call
@@ -284,7 +284,7 @@ This fork has the following changes:
     data for uploads, ensuring that no data is corrupted in transit.
 
 *   The `use_cache` option has been removed. An on-disk cache is not
-    currently supported, except for the short-term writeback cache.
+    currently supported, except for the short-term write-back cache.
     For AFS-style caching (which is more-or-less what s3fs uses), a
     seperate caching layer would be more appropriate.
 
@@ -334,7 +334,7 @@ make it display more messages, you can enable some debug flags:
 *   `DEBUG_WIRE` logs each time it contacts S3. This can be useful
     for seeing how well the cache is working.
 
-*   `DEBUG_CACHE` logs information about the writeback cache. This
+*   `DEBUG_CACHE` logs information about the write-back cache. This
     is fairly chatty output.
 
 All of these messages go to `/var/log/syslog`, so open a terminal
@@ -351,8 +351,8 @@ Then do a `make clean` and another `make` and `make install` to
 rebuild it with the caching options.
 
 
-The writeback cache
--------------------
+The write-back cache
+--------------------
 
 When a file is opened, it is transferred from S3 to a local file.
 This is created in `/tmp` and immediately unlinked, so it is not
@@ -439,13 +439,13 @@ There are six main source files:
 
 3.  `attrcache.cpp`: the SQLite attribute caching. This cache is
     intended to reflect the current state of the server, and it
-    knows nothing about the writeback cache.
+    knows nothing about the write-back cache.
 
 4.  `s3request.cpp`: wire requests to Amazon S3 using `libcurl`.
     `s3request` is ignorant of any caching, and is purely concerned
     with forming requests and gathering responses.
 
-5.  `filecache.cpp`: the writeback cache. This cache draws from and
+5.  `filecache.cpp`: the write-back cache. This cache draws from and
     updates the attribute cache when necessary, and issues S3
     requests when needed. In that sense, it sits right below the
     main file system operations layer.
