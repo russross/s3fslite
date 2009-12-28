@@ -66,8 +66,8 @@ std::string getAcl(mode_t mode) {
 static size_t header_callback(void *data, size_t blockSize, size_t numBlocks,
         void *userPtr)
 {
-    headers_t *headers = reinterpret_cast<headers_t *>(userPtr);
-    std::string header(reinterpret_cast<char *>(data), blockSize * numBlocks);
+    headers_t *headers = static_cast<headers_t *>(userPtr);
+    std::string header(static_cast<char *>(data), blockSize * numBlocks);
     std::string key;
     std::stringstream ss(header);
     if (std::getline(ss, key, ':')) {
@@ -94,7 +94,7 @@ size_t writeCallback(void* data, size_t blockSize, size_t numBlocks,
         void *userPtr)
 {
     std::string *userString = static_cast<std::string *>(userPtr);
-    (*userString).append(reinterpret_cast<const char *>(data),
+    (*userString).append(static_cast<const char *>(data),
             blockSize * numBlocks);
     return blockSize * numBlocks;
 }
@@ -632,8 +632,8 @@ void S3request::remove(std::string path) {
 }
 
 // returns true if there are more entries to come
-int S3request::get_directory(std::string path, std::string &marker,
-        stringlist &result, int max_entries)
+bool S3request::get_directory(std::string path, std::string &marker,
+        stringlist &result, int max_entries, bool includeall)
 {
 #ifdef DEBUG_WIRE
     syslog(LOG_INFO, "S3request::get_directory[%s] marker[%s]", path.c_str(),
@@ -643,10 +643,15 @@ int S3request::get_directory(std::string path, std::string &marker,
     std::string date = get_date();
 
     // set up the query string
-    std::string query = "delimiter=/&prefix=";
+    std::string prefix;
 
     if (path != "/")
-        query += urlEncode(path.substr(1) + "/");
+        prefix = urlEncode(path.substr(1) + "/");
+
+    std::string query("prefix=" + prefix);
+
+    if (!includeall)
+        query += "&delimiter=/";
 
     if (marker.size() > 0)
         query += "&marker=" + urlEncode(marker);
@@ -667,7 +672,7 @@ int S3request::get_directory(std::string path, std::string &marker,
 
     req.execute();
 
-    int moretocome = 0;
+    bool moretocome = false;
     marker = "";
 
     // parse the response
@@ -692,7 +697,7 @@ int S3request::get_directory(std::string path, std::string &marker,
         if (cur_node_name != "Contents" || cur_node->children == NULL)
             continue;
 
-        std::string Key;
+        std::string key;
         for (xmlNodePtr sub_node = cur_node->children; sub_node != NULL;
                 sub_node = sub_node->next)
         {
@@ -707,13 +712,12 @@ int S3request::get_directory(std::string path, std::string &marker,
                 reinterpret_cast<const char *>(sub_node->name);
 
             if (elementName == "Key")
-                Key = reinterpret_cast<const char *>(
+                key = reinterpret_cast<const char *>(
                         sub_node->children->content);
         }
-        if (Key.size() > 0) {
-            std::string::size_type start(Key.find_last_of("/"));
-            start++;
-            result.push_back(Key.substr(start, Key.size() - start));
+        if (key.size() > prefix.size()) {
+            result.push_back(key.substr(prefix.size(),
+                        key.size() - prefix.size()));
         }
     }
     xmlFreeDoc(doc);

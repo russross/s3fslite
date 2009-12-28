@@ -99,8 +99,11 @@ std::string trim_quotes(const std::string &s) {
 }
 
 class Transaction {
+    private:
+        bool havelock;
+
     public:
-        Transaction();
+        Transaction(bool getlock = true);
         ~Transaction();
 
         void getExisting(std::string path);
@@ -113,12 +116,14 @@ class Transaction {
         Openfile *target;
 };
 
-Transaction::Transaction() {
+Transaction::Transaction(bool getlock) {
     file = NULL;
     target = NULL;
+    havelock = getlock;
 
     // acquire the global lock
-    pthread_mutex_lock(&lock);
+    if (getlock)
+        pthread_mutex_lock(&lock);
 }
 
 Transaction::~Transaction() {
@@ -132,7 +137,8 @@ Transaction::~Transaction() {
     }
 
     // release the global lock
-    pthread_mutex_unlock(&lock);
+    if (havelock)
+        pthread_mutex_unlock(&lock);
 }
 
 void Transaction::getExisting(std::string path) {
@@ -479,6 +485,63 @@ int s3fs_rmdir(const char *path) {
     }
 }
 
+Openfile *rename_file(std::string from, std::string to, bool toplevel) {
+    Transaction t(false);
+
+    // note: getPair sets source info, clears target info and fd
+    t.getPair(from, to);
+
+    // move the metadata over
+    t.target->info = t.file->info;
+    t.target->info->path = to;
+
+    bool isdir = t.file->info->mode & S_IFDIR;
+    t.file->info = NULL;
+
+    if (isdir && t.file->fd >= 0) {
+        syslog(LOG_ERR, "s3fs_rename: directory with open fd");
+        throw -EIO;
+    }
+
+    // if we have the file locally, move it locally
+    if (t.file->fd >= 0) {
+        t.target->fd = t.file->fd;
+        t.file->fd = -1;
+
+        t.target->exists = false;
+        t.target->deleted = false;
+        t.target->dirty_data = true;
+        t.target->dirty_metadata = true;
+    }
+
+    // if we don't have the file locally, move it remotely
+    else {
+        // make sure the attr cache reflects what is on the server
+        attrcache->del(from);
+        S3request::set_fileinfo(from, t.target->info);
+        attrcache->set(t.target->info);
+
+        t.target->exists = true;
+        t.target->deleted = false;
+        t.target->dirty_data = false;
+        t.target->dirty_metadata = false;
+    }
+
+    if (toplevel && isdir) {
+        // defer deleting the source until all descendents are moved
+        Openfile *source = t.file;
+
+        // detach it from the transaction so it is not released
+        t.file = NULL;
+
+        return source;
+    } else {
+        // delete the source now
+        t.file->deleted = true;
+        return NULL;
+    }
+}
+
 int s3fs_rename(const char *from, const char *to) {
 #ifdef DEBUG
     syslog(LOG_INFO, "rename[%s] -> [%s]", from, to);
@@ -487,43 +550,47 @@ int s3fs_rename(const char *from, const char *to) {
     try {
         Transaction t;
 
-        // note: getPair sets source info, clears target info and fd
-        t.getPair(from, to);
+        // move the file over
+        t.path = from;
 
-        // TODO: support renaming directories
-        if (t.file->info->mode & S_IFDIR)
-            throw -ENOTSUP;
+        // if the file is a directory, rename_file will return the
+        // Openfile object for the source so we can delete it at the end
+        // we are responsible for releasing it, so hand it to our transaction
+        t.file = rename_file(from, to, true);
 
-        // move the metadata over
-        t.target->info = t.file->info;
-        t.target->info->path = to;
-        t.file->info = NULL;
+        if (t.file) {
+            // this is a directory, so rename all descendents
+            Openfile::sync();
 
-        // if we have the file locally, move it locally
-        if (t.file->fd >= 0) {
-            t.target->fd = t.file->fd;
-            t.file->fd = -1;
+            string marker;
+            bool moretocome = true;
 
-            t.target->exists = false;
-            t.target->deleted = false;
-            t.target->dirty_data = true;
-            t.target->dirty_metadata = true;
+            while (moretocome) {
+                stringlist entries;
+                moretocome = S3request::get_directory(from, marker, entries,
+                        MAX_KEYS_PER_DIR_REQUEST, true);
+
+                for (size_t i = 0; i < entries.size(); i++) {
+                    string src(from);
+                    src += "/" + entries[i];
+                    string tgt(to);
+                    tgt += "/" + entries[i];
+
+#ifdef DEBUG
+                    syslog(LOG_INFO, "rename[%s] -> [%s]",
+                            src.c_str(), tgt.c_str());
+#endif
+
+                    // move the file over
+                    rename_file(src, tgt, false);
+                }
+            }
+
+            // move any files inside the directory before removing the source
+            t.file->deleted = true;
+
+            Openfile::sync();
         }
-
-        // if we don't have the file locally, move it remotely
-        else {
-            // make sure the attr cache reflects what is on the server
-            attrcache->del(from);
-            S3request::set_fileinfo(from, t.target->info);
-            attrcache->set(t.target->info);
-
-            t.target->exists = true;
-            t.target->deleted = false;
-            t.target->dirty_data = false;
-            t.target->dirty_metadata = false;
-        }
-
-        t.file->deleted = true;
 
         return 0;
     } catch (int e) {
@@ -810,11 +877,12 @@ int s3fs_readdir(const char *path, void *buf,
         filler(buf, "..", 0, 0);
 
         string marker;
-        int moretocome = 1;
+        bool moretocome = true;
 
         while (moretocome) {
             stringlist entries;
-            moretocome = S3request::get_directory(path, marker, entries);
+            moretocome = S3request::get_directory(path, marker, entries,
+                    MAX_KEYS_PER_DIR_REQUEST);
 
             for (size_t i = 0; i < entries.size(); i++) {
                 if (filler(buf, entries[i].c_str(), 0, 0)) {

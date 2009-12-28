@@ -18,8 +18,8 @@ class cmp_file {
         }
 };
 
-std::map<std::string, Openfile *> open_files;
-std::priority_queue<Openfile *, std::vector<Openfile *>, cmp_file> queue;
+static std::map<std::string, Openfile *> open_files;
+static std::priority_queue<Openfile *, std::vector<Openfile *>, cmp_file> queue;
 
 Openfile::Openfile(std::string path, bool exists) {
 #ifdef DEBUG_CACHE

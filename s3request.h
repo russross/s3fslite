@@ -42,6 +42,6 @@ class S3request {
         static int get_file(std::string path, Fileinfo *info);
         static void put_file(Fileinfo *info, int fd);
         static void remove(std::string path);
-        static int get_directory(std::string path, std::string &marker,
-                stringlist &result, int max_entries = MAX_KEYS_PER_DIR_REQUEST);
+        static bool get_directory(std::string path, std::string &marker,
+                stringlist &result, int max_entries, bool includeall = false);
 };

@@ -246,6 +246,12 @@ This fork has the following changes:
     but it does not persist across mounts. For large file systems,
     losing the entire cache on a restart is costly.
 
+*   Directories can be renamed. This requires renaming all of the
+    directory's children, grandchildren, etc., so it can be a slow
+    operation, but it works. Files are all copied at the server, not
+    by downloading them and re-uploading them, the same as for
+    metadata updates, regular renames, and links.
+
 *   `readdir` requests do *not* send off file attribute requests.
     The original code effectively issues a `getattr` request to S3
     for each file when directories are listed. The cache was not
@@ -411,9 +417,13 @@ couple of limitations:
     loadable since FUSE requires this kernel module and s3fs
     requires it as well.
 
-*   You cannot rename directories. Doing so will require doing a
-    deep move of everything in the directory. This is on my TODO
-    list, but it has not happened yet.
+*   Hard links are faked. They are implemented by doing a simple
+    (server-side) copy. This is great for most cases (notably when
+    using hard links as a way to move a file to another directory),
+    but it is not the same as a real hard link. If a file is open
+    when it is linked, the two versions actually do share storage
+    (and updates), but only until one of them is flushed from the
+    cache. I do not recommend relying on this behavior.
 
 
 License:
