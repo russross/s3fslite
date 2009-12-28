@@ -5,25 +5,27 @@
 #include <syslog.h>
 #include <errno.h>
 
+#include "common.h"
 #include "fileinfo.h"
 #include "attrcache.h"
+#include "filecache.h"
 #include "s3request.h"
-#include "openfile.h"
 
 class cmp_file {
     public:
-        bool operator ()(Openfile *&a, Openfile *&b) {
+        bool operator ()(Filecache *&a, Filecache *&b) {
             // we want older stuff sorting as higher
             return a->time_enqueued > b->time_enqueued;
         }
 };
 
-static std::map<std::string, Openfile *> open_files;
-static std::priority_queue<Openfile *, std::vector<Openfile *>, cmp_file> queue;
+static std::map<std::string, Filecache *> open_files;
+static std::priority_queue<Filecache *, std::vector<Filecache *>, cmp_file>
+    queue;
 
-Openfile::Openfile(std::string path, bool exists) {
+Filecache::Filecache(std::string path, bool exists) {
 #ifdef DEBUG_CACHE
-        syslog(LOG_INFO, "Openfile::new[%s]", path.c_str());
+        syslog(LOG_INFO, "Filecache::new[%s]", path.c_str());
 #endif
 
     this->path = path;
@@ -37,9 +39,9 @@ Openfile::Openfile(std::string path, bool exists) {
     enqueued = false;
 }
 
-Openfile::~Openfile() {
+Filecache::~Filecache() {
 #ifdef DEBUG_CACHE
-        syslog(LOG_INFO, "Openfile::delete[%s]", path.c_str());
+        syslog(LOG_INFO, "Filecache::delete[%s]", path.c_str());
 #endif
 
     if (info) {
@@ -53,16 +55,16 @@ Openfile::~Openfile() {
         fd = -1;
     }
     if (opencount)
-        syslog(LOG_ERR, "Openfile deleted with non-zero open count");
+        syslog(LOG_ERR, "Filecache deleted with non-zero open count");
 }
 
-Openfile *Openfile::get(std::string path, mode_t mode) {
-    Openfile *res = NULL;
+Filecache *Filecache::get(std::string path, mode_t mode) {
+    Filecache *res = NULL;
 
     if (open_files.count(path) > 0) {
         res = open_files[path];
     } else {
-        res = new Openfile(path, !mode);
+        res = new Filecache(path, !mode);
         open_files[path] = res;
     }
 
@@ -72,7 +74,7 @@ Openfile *Openfile::get(std::string path, mode_t mode) {
     return res;
 }
 
-void Openfile::release() {
+void Filecache::release() {
     if (!opencount && !enqueued) {
         // queue this up for flushing
         enqueued = true;
@@ -83,11 +85,11 @@ void Openfile::release() {
     }
 }
 
-Openfile *Openfile::from_queue() {
+Filecache *Filecache::from_queue() {
     time_t now = time(NULL);
 
     while (queue.size()) {
-        Openfile *file = queue.top();
+        Filecache *file = queue.top();
         queue.pop();
         open_files.erase(file->path);
 
@@ -97,7 +99,7 @@ Openfile *Openfile::from_queue() {
 
             if (file->opencount) {
 #ifdef DEBUG_CACHE
-            syslog(LOG_INFO, "Openfile::from_queue resurrecting open file[%s]",
+            syslog(LOG_INFO, "Filecache::from_queue resurrecting open file[%s]",
                     file->path.c_str());
 #endif
 
@@ -107,7 +109,7 @@ Openfile *Openfile::from_queue() {
                 continue;
             } else {
 #ifdef DEBUG_CACHE
-            syslog(LOG_INFO, "Openfile::from_queue resurrecting file[%s]",
+            syslog(LOG_INFO, "Filecache::from_queue resurrecting file[%s]",
                     file->path.c_str());
 #endif
 
@@ -122,7 +124,7 @@ Openfile *Openfile::from_queue() {
         if (now - file->time_enqueued >= CACHE_TIMEOUT) {
             // return it with the lock held
 #ifdef DEBUG_CACHE
-            syslog(LOG_INFO, "Openfile::from_queue expiring[%s]",
+            syslog(LOG_INFO, "Filecache::from_queue expiring[%s]",
                     file->path.c_str());
 #endif
             return file;
@@ -137,9 +139,9 @@ Openfile *Openfile::from_queue() {
     return NULL;
 }
 
-void Openfile::fsync() {
+void Filecache::fsync() {
 #ifdef DEBUG_CACHE
-    syslog(LOG_INFO, "Openfile::fsync[%s]", path.c_str());
+    syslog(LOG_INFO, "Filecache::fsync[%s]", path.c_str());
 #endif
 
     // new file that was deleted before it was ever transmitted
@@ -215,12 +217,12 @@ void Openfile::fsync() {
     // not new, not deleted, not updated; this is easy...
 }
 
-void Openfile::sync() {
+void Filecache::sync() {
 #ifdef DEBUG_CACHE
-    syslog(LOG_INFO, "Openfile::sync all");
+    syslog(LOG_INFO, "Filecache::sync all");
 #endif
 
-    for (std::map<std::string, Openfile *>::iterator
+    for (std::map<std::string, Filecache *>::iterator
             it = open_files.begin();
             it != open_files.end();
             it++)
@@ -230,18 +232,18 @@ void Openfile::sync() {
 }
 
 // return true if any files are currently open with the given prefix
-bool Openfile::openfiles(std::string prefix) {
+bool Filecache::openfiles(std::string prefix) {
 #ifdef DEBUG_CACHE
-    syslog(LOG_INFO, "Openfile::openfiles checking for prefix[%s]",
+    syslog(LOG_INFO, "Filecache::openfiles checking for prefix[%s]",
             prefix.c_str());
 #endif
 
-    for (std::map<std::string, Openfile *>::iterator
+    for (std::map<std::string, Filecache *>::iterator
             it = open_files.begin();
             it != open_files.end();
             it++)
     {
-        Openfile *file = it->second;
+        Filecache *file = it->second;
         if (file->path.length() >= prefix.length() &&
                 file->path.compare(0, prefix.length(), prefix) == 0 &&
                 file->opencount > 0)
@@ -251,4 +253,33 @@ bool Openfile::openfiles(std::string prefix) {
     }
 
     return false;
+}
+
+// the loop for the cache flushing thread
+void *flush_loop(void *param) {
+    pthread_mutex_lock(&global_lock);
+
+    // once we get the lock, we hold on to it until the queue is clear
+    // this prevents other transactions from happening, which prevents
+    // the backlog from getting too big.  we only release the lock when
+    // we are ready to sleep
+    while (!flush_shutdown) {
+        Filecache *file = Filecache::from_queue();
+        if (file) {
+            file->fsync();
+            file->release();
+            delete file;
+        } else {
+            pthread_mutex_unlock(&global_lock);
+            sleep(1);
+            pthread_mutex_lock(&global_lock);
+        }
+    }
+
+    // sync everything when shutting down
+    Filecache::sync();
+
+    pthread_mutex_unlock(&global_lock);
+
+    return NULL;
 }

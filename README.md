@@ -404,21 +404,12 @@ To observe how all of this works, enable all of the debugging logs
 Known Issues:
 -------------
 
-s3fslite should be working fine with S3 storage. However, There are
-couple of limitations:
+s3fslite works fine with S3 storage. However, There are couple of
+limitations:
 
-*   There is no full UID/GID support yet, everything looks as
-    "`root`" and if you allow others to access the bucket, others
-    can erase files. There is, however, permissions support built
-    in.
-
-*   CentOS 4.x/RHEL 4.x users: if you use the kernel that shipped
-    with your distribution and didn't upgrade to the latest kernel
-    RedHat/CentOS gives, you might have a problem loading the
-    "`fuse`" kernel. Please upgrade to the latest kernel (2.6.16 or
-    above) and make sure "`fuse`" kernel module is compiled and
-    loadable since FUSE requires this kernel module and s3fs
-    requires it as well.
+*   File permissions are not enforced. Files are always created as
+    the user who mounts the file system (normally `root`), but
+    anyone can change anything.
 
 *   Hard links are faked. They are implemented by doing a simple
     (server-side) copy. This is great for most cases (notably when
@@ -427,6 +418,41 @@ couple of limitations:
     when it is linked, the two versions actually do share storage
     (and updates), but only until one of them is flushed from the
     cache. I do not recommend relying on this behavior.
+
+*   This note comes from the original s3fs: CentOS 4.x/RHEL 4.x
+    users: if you use the kernel that shipped with your distribution
+    and didn't upgrade to the latest kernel RedHat/CentOS gives, you
+    might have a problem loading the "`fuse`" kernel. Please upgrade
+    to the latest kernel (2.6.16 or above) and make sure "`fuse`"
+    kernel module is compiled and loadable since FUSE requires this
+    kernel module and s3fs requires it as well.
+
+
+Source code tour
+----------------
+
+There are six main source files:
+
+1.  `common.cpp`: utility functions and global variables.
+
+2.  `fileinfo.cpp`: a simple class to hold file attributes.
+
+3.  `attrcache.cpp`: the SQLite attribute caching. This cache is
+    intended to reflect the current state of the server, and it
+    knows nothing about the writeback cache.
+
+4.  `s3request.cpp`: wire requests to Amazon S3 using `libcurl`.
+    `s3request` is ignorant of any caching, and is purely concerned
+    with forming requests and gathering responses.
+
+5.  `filecache.cpp`: the writeback cache. This cache draws from and
+    updates the attribute cache when necessary, and issues S3
+    requests when needed. In that sense, it sits right below the
+    main file system operations layer.
+
+6.  `s3fs.cpp`: the FUSE file system operations, along with startup
+    and shutdown code. This code depends on and knows about
+    everything else.
 
 
 License:

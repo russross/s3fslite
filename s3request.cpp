@@ -15,7 +15,7 @@
 #include <libxml/parser.h>
 #include <libxml/tree.h>
 
-#include "s3fs.h"
+#include "common.h"
 #include "fileinfo.h"
 #include "s3request.h"
 

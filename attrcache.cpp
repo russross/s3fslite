@@ -5,9 +5,11 @@
 #include <syslog.h>
 #include <sqlite3.h>
 
+#include "common.h"
 #include "fileinfo.h"
 #include "attrcache.h"
-#include "s3fs.h"
+
+Attrcache *attrcache;
 
 //
 // SQLite attribute caching

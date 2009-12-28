@@ -6,6 +6,7 @@
 #include <string.h>
 #include <time.h>
 #include <fcntl.h>
+#include <pthread.h>
 
 #define DEFAULT_MIME_TYPE "application/octet-stream"
 #define DIRECTORY_MIME_TYPE "application/x-directory"
@@ -28,6 +29,9 @@ class cmp_ignore_case {
 typedef std::map<std::string, std::string, cmp_ignore_case> mimes_t;
 typedef std::vector<std::string> stringlist;
 
+extern pthread_mutex_t global_lock;
+extern pthread_t flush_thread;
+extern bool flush_shutdown;
 extern mimes_t mimeTypes;
 extern time_t readwrite_timeout;
 extern long connect_timeout;
@@ -39,4 +43,5 @@ extern std::string bucket;
 extern std::string AWSAccessKeyId;
 extern std::string AWSSecretAccessKey;
 extern std::string host;
+extern std::string attr_cache;
 extern mode_t root_mode;

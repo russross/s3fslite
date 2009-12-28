@@ -35,88 +35,27 @@
 // C and Unix libraries
 #include <string.h>
 #include <unistd.h>
+#include <stdlib.h>
 #include <errno.h>
 #include <syslog.h>
 #include <time.h>
 #include <pthread.h>
 
-// non-standard dependencies
-#include <openssl/hmac.h>
+// FUSE
 #include <fuse.h>
 
 // project dependencies
+#include "common.h"
 #include "fileinfo.h"
 #include "attrcache.h"
+#include "filecache.h"
 #include "s3request.h"
-#include "openfile.h"
-#include "s3fs.h"
 
-// config parameters
-std::string bucket;
-std::string AWSAccessKeyId;
-std::string AWSSecretAccessKey;
-std::string host("http://s3.amazonaws.com");
-mode_t root_mode = 0755;
-std::string attr_cache;
-int retries = 2;
-long connect_timeout = 2;
-time_t readwrite_timeout = 10;
+// the FUSE file system operation table
+struct fuse_operations s3fs_oper;
 
-// private, public-read, public-read-write, authenticated-read
-std::string default_acl;
-std::string private_acl("private");
-std::string public_acl("public-read");
-
-Attrcache *attrcache;
-
-pthread_mutex_t lock;
-
-pthread_t flush_thread;
-bool flush_shutdown;
-
-mimes_t mimeTypes;
-
-// fd -> flags
-static std::string SPACES(" \t\r\n");
-static std::string QUOTES("\"");
-
-std::string trim_spaces(const std::string &s) {
-    std::string::size_type start(s.find_first_not_of(SPACES));
-    std::string::size_type end(s.find_last_not_of(SPACES));
-    if (start == std::string::npos || end == std::string::npos)
-        return "";
-    return s.substr(start, end + 1 - start);
-}
-
-std::string trim_quotes(const std::string &s) {
-    std::string::size_type start(s.find_first_not_of(QUOTES));
-    std::string::size_type end(s.find_last_not_of(QUOTES));
-    if (start == std::string::npos || end == std::string::npos)
-        return "";
-    return s.substr(start, end + 1 - start);
-}
-
-unsigned long num(std::string value) {
-    return strtoul(value.c_str(), NULL, 10);
-}
-
-unsigned long long longnum(std::string value) {
-    return strtoull(value.c_str(), NULL, 10);
-}
-
-int create_tempfile() {
-    char localname[32];
-    strcpy(localname, "/tmp/s3fs.XXXXXX");
-    int fd = mkstemp(localname);
-    if (fd < 0)
-        throw -errno;
-    if (unlink(localname) < 0) {
-        close(fd);
-        throw -errno;
-    }
-    return fd;
-}
-
+// a single operation: this handles obtaining and cleaning up basic resources
+// necessary for every operation
 class Transaction {
     private:
         bool havelock;
@@ -131,8 +70,8 @@ class Transaction {
         void getFd();
 
         std::string path;
-        Openfile *file;
-        Openfile *target;
+        Filecache *file;
+        Filecache *target;
 };
 
 Transaction::Transaction(bool getlock) {
@@ -142,7 +81,7 @@ Transaction::Transaction(bool getlock) {
 
     // acquire the global lock
     if (getlock)
-        pthread_mutex_lock(&lock);
+        pthread_mutex_lock(&global_lock);
 }
 
 Transaction::~Transaction() {
@@ -157,12 +96,12 @@ Transaction::~Transaction() {
 
     // release the global lock
     if (havelock)
-        pthread_mutex_unlock(&lock);
+        pthread_mutex_unlock(&global_lock);
 }
 
 void Transaction::getExisting(std::string path) {
     this->path = path;
-    file = Openfile::get(path);
+    file = Filecache::get(path);
     if (file->enqueued)
         file->resurrected = true;
 
@@ -204,7 +143,7 @@ void Transaction::getExisting(std::string path) {
 
 void Transaction::getNew(std::string path, mode_t mode) {
     this->path = path;
-    file = Openfile::get(path, mode);
+    file = Filecache::get(path, mode);
     if (file->enqueued)
         file->resurrected = true;
 
@@ -239,8 +178,8 @@ void Transaction::getPair(std::string src, std::string tgt) {
         throw -ENOTSUP;
 
     path = src;
-    file = Openfile::get(src);
-    target = Openfile::get(tgt);
+    file = Filecache::get(src);
+    target = Filecache::get(tgt);
 
     // fail if either file is currently open
     if (file->opencount > 0 || target->opencount > 0)
@@ -304,33 +243,6 @@ void Transaction::getFd() {
         file->fd = S3request::get_file(path, file->info);
 }
 
-void *flush_loop(void *param) {
-    pthread_mutex_lock(&lock);
-
-    // once we get the lock, we hold on to it until the queue is clear
-    // this prevents other transactions from happening, which prevents
-    // the backlog from getting too big.  we only release the lock when
-    // we are ready to sleep
-    while (!flush_shutdown) {
-        Openfile *file = Openfile::from_queue();
-        if (file) {
-            file->fsync();
-            file->release();
-            delete file;
-        } else {
-            pthread_mutex_unlock(&lock);
-            sleep(1);
-            pthread_mutex_lock(&lock);
-        }
-    }
-
-    // sync everything when shutting down
-    Openfile::sync();
-
-    pthread_mutex_unlock(&lock);
-
-    return NULL;
-}
 
 //
 //
@@ -486,7 +398,7 @@ int s3fs_rmdir(const char *path) {
         t.getExisting(path);
 
         // sync any deleted files inside this directory
-        Openfile::sync();
+        Filecache::sync();
 
         // make sure the directory is empty
         std::string marker;
@@ -504,7 +416,7 @@ int s3fs_rmdir(const char *path) {
     }
 }
 
-Openfile *rename_file(std::string from, std::string to, bool toplevel) {
+Filecache *rename_file(std::string from, std::string to, bool toplevel) {
     Transaction t(false);
 
     // note: getPair sets source info, clears target info and fd
@@ -513,7 +425,7 @@ Openfile *rename_file(std::string from, std::string to, bool toplevel) {
     bool isdir = t.file->info->mode & S_IFDIR;
 
     // if it is a directory with open files, fail
-    if (toplevel && isdir && Openfile::openfiles(from + "/"))
+    if (toplevel && isdir && Filecache::openfiles(from + "/"))
         throw -EBUSY;
 
     // move the metadata over
@@ -553,7 +465,7 @@ Openfile *rename_file(std::string from, std::string to, bool toplevel) {
 
     if (toplevel && isdir) {
         // defer deleting the source until all descendents are moved
-        Openfile *source = t.file;
+        Filecache *source = t.file;
 
         // detach it from the transaction so it is not released
         t.file = NULL;
@@ -578,13 +490,13 @@ int s3fs_rename(const char *from, const char *to) {
         t.path = from;
 
         // if the file is a directory, rename_file will return the
-        // Openfile object for the source so we can delete it at the end
+        // Filecache object for the source so we can delete it at the end
         // we are responsible for releasing it, so hand it to our transaction
         t.file = rename_file(from, to, true);
 
         if (t.file) {
             // this is a directory, so rename all descendents
-            Openfile::sync();
+            Filecache::sync();
 
             std::string marker;
             bool moretocome = true;
@@ -613,7 +525,7 @@ int s3fs_rename(const char *from, const char *to) {
             // move any files inside the directory before removing the source
             t.file->deleted = true;
 
-            Openfile::sync();
+            Filecache::sync();
         }
 
         return 0;
@@ -895,7 +807,7 @@ int s3fs_readdir(const char *path, void *buf,
         t.getExisting(path);
 
         // sync everything inside the directory
-        Openfile::sync();
+        Filecache::sync();
 
         filler(buf, ".", 0, 0);
         filler(buf, "..", 0, 0);
@@ -927,7 +839,7 @@ void *s3fs_init(struct fuse_conn_info *conn) {
     syslog(LOG_INFO, "init[%s]", bucket.c_str());
 
     // global lock
-    pthread_mutex_init(&lock, NULL);
+    pthread_mutex_init(&global_lock, NULL);
 
     // openssl
     curl_global_init(CURL_GLOBAL_ALL);
@@ -961,7 +873,7 @@ void s3fs_destroy(void*) {
     pthread_join(flush_thread, NULL);
 
     curl_global_cleanup();
-    pthread_mutex_destroy(&lock);
+    pthread_mutex_destroy(&global_lock);
 }
 
 int my_fuse_opt_proc(void *data, const char *arg,
@@ -1015,8 +927,6 @@ int my_fuse_opt_proc(void *data, const char *arg,
     }
     return 1;
 }
-
-struct fuse_operations s3fs_oper;
 
 int main(int argc, char *argv[]) {
     bzero(&s3fs_oper, sizeof(s3fs_oper));

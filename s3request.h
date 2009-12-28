@@ -5,8 +5,8 @@
 #include <stdio.h>
 #include <curl/curl.h>
 
+#include "common.h"
 #include "fileinfo.h"
-#include "s3fs.h"
 
 class S3request {
     private:

@@ -1,4 +1,4 @@
-SOURCES=s3fs.cpp fileinfo.cpp attrcache.cpp s3request.cpp openfile.cpp
+SOURCES=common.cpp fileinfo.cpp attrcache.cpp filecache.cpp s3request.cpp s3fs.cpp
 
 CPP=g++
 
