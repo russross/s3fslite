@@ -61,7 +61,6 @@ unsigned long long longnum(std::string value) {
     return strtoull(value.c_str(), NULL, 10);
 }
 
-#include <syslog.h>
 int create_tempfile() {
     // create the name template for the temp file
     std::string tmpname(writeback_cache);
@@ -73,7 +72,6 @@ int create_tempfile() {
 
     char *localname = new char[tmpname.size() + 1];
     strcpy(localname, tmpname.c_str());
-    syslog(LOG_INFO, "tempfile[%s]", localname);
 
     // create a temporary file
     int fd = mkstemp(localname);
