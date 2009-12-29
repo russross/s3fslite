@@ -443,12 +443,13 @@ limitations:
         same thing for caching. You mount s3fslite, then you mount
         another layer on top of it that provides caching.
 
-    *   FuseCompress: Working on the same basic model as the others,
-        this system promises to compress data for a file system that
-        does not have direct support for compression.
+    *   Compression: FuseCompress works on the same basic model as
+        the others, compressing data for a file system that does not
+        have direct support for compression.
 
-    I have not tried these solutions, and would welcome reports
-    about whether or not (or how well) they work.
+    I have not tried these solutions (I just googled for them), and
+    would welcome reports about whether or not (or how well) they
+    work.
 
 
 Source code tour
