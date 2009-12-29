@@ -20,6 +20,7 @@ std::string writeback_cache("/tmp");
 int retries = 2;
 long connect_timeout = 2;
 time_t readwrite_timeout = 10;
+int writeback_delay = 5;
 
 // private, public-read, public-read-write, authenticated-read
 std::string acl;

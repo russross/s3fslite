@@ -226,6 +226,10 @@ The complete list of supported options is:
     generally see anything listed in the given directory, but the
     storage of that file system will still be used.
 
+*   `writeback_delay=` specify the number of seconds a closed file
+    should be cached before changes are uploaded to S3
+    (default `5`).
+
 
 Changes from s3fs
 -----------------

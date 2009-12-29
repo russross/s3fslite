@@ -121,7 +121,7 @@ Filecache *Filecache::from_queue() {
             }
         }
 
-        if (now - file->time_enqueued >= CACHE_TIMEOUT) {
+        if (now - file->time_enqueued >= writeback_delay) {
             // return it with the lock held
 #ifdef DEBUG_CACHE
             syslog(LOG_INFO, "Filecache::from_queue expiring[%s]",

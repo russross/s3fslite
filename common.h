@@ -11,7 +11,6 @@
 #define DEFAULT_MIME_TYPE "application/octet-stream"
 #define DIRECTORY_MIME_TYPE "application/x-directory"
 #define MAX_KEYS_PER_DIR_REQUEST 200
-#define CACHE_TIMEOUT 5
 
 std::string trim_spaces(const std::string &s);
 std::string trim_quotes(const std::string &s);
@@ -36,6 +35,7 @@ extern mimes_t mimeTypes;
 extern time_t readwrite_timeout;
 extern long connect_timeout;
 extern int retries;
+extern int writeback_delay;
 extern std::string acl;
 extern std::string private_acl;
 extern std::string public_acl;

@@ -916,6 +916,10 @@ int my_fuse_opt_proc(void *data, const char *arg,
             readwrite_timeout = num(strchr(arg, '=') + 1);
             return 0;
         }
+        if (strstr(arg, "writeback_delay=") != 0) {
+            writeback_delay = num(strchr(arg, '=') + 1);
+            return 0;
+        }
         if (strstr(arg, "url=") != 0) {
             host = strchr(arg, '=') + 1;
             return 0;
