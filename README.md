@@ -211,7 +211,9 @@ The complete list of supported options is:
     write operations (default `10`)
 
 *   `url=` specify the host to connect to (default
-    `http://s3.amazonaws.com`)
+    `http://s3.amazonaws.com`). If you want to use HTTPS instead of
+    HTTP to get secure transfers, specify
+    `url=https://s3.amazonaws.com` as a mount option.
 
 *   `attr_cache=` specify the directory where the attribute cache
     database should be created and accessed (default current
