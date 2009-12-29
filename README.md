@@ -429,6 +429,27 @@ limitations:
     kernel module is compiled and loadable since FUSE requires this
     kernel module and s3fs requires it as well.
 
+*   S3fslite is mainly intended for publishing data to S3. It does
+    not provide general local caching, nor services like encryption
+    or compression.  Some of these issues can be addressed with
+    existing systems:
+
+    *   Encryption: if you want file-by-file encryption (as opposed
+        to encrypting an entire block device), you can plug in EncFS
+        with s3fslite. This acts as a layer on top of any other file
+        system and provides encryption services.
+
+    *   Caching: Systems like FS-Cache and CacheFS promise to do the
+        same thing for caching. You mount s3fslite, then you mount
+        another layer on top of it that provides caching.
+
+    *   FuseCompress: Working on the same basic model as the others,
+        this system promises to compress data for a file system that
+        does not have direct support for compression.
+
+    I have not tried these solutions, and would welcome reports
+    about whether or not (or how well) they work.
+
 
 Source code tour
 ----------------
