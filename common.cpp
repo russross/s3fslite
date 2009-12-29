@@ -16,12 +16,13 @@ std::string AWSSecretAccessKey;
 std::string host("http://s3.amazonaws.com");
 mode_t root_mode = 0755;
 std::string attr_cache;
+std::string writeback_cache("/tmp");
 int retries = 2;
 long connect_timeout = 2;
 time_t readwrite_timeout = 10;
 
 // private, public-read, public-read-write, authenticated-read
-std::string default_acl;
+std::string acl;
 std::string private_acl("private");
 std::string public_acl("public-read");
 
@@ -60,16 +61,34 @@ unsigned long long longnum(std::string value) {
     return strtoull(value.c_str(), NULL, 10);
 }
 
+#include <syslog.h>
 int create_tempfile() {
-    char localname[32];
-    strcpy(localname, "/tmp/s3fs.XXXXXX");
+    // create the name template for the temp file
+    std::string tmpname(writeback_cache);
+    if (tmpname.size() == 0)
+        tmpname = "/tmp";
+    if (tmpname[tmpname.size() - 1] != '/')
+        tmpname += "/";
+    tmpname += "s3fslite.XXXXXX";
+
+    char *localname = new char[tmpname.size() + 1];
+    strcpy(localname, tmpname.c_str());
+    syslog(LOG_INFO, "tempfile[%s]", localname);
+
+    // create a temporary file
     int fd = mkstemp(localname);
-    if (fd < 0)
-        throw -errno;
-    if (unlink(localname) < 0) {
-        close(fd);
+    if (fd < 0) {
+        delete[] localname;
         throw -errno;
     }
+
+    // unlink it immediately so it will be cleaned up when closed
+    if (unlink(localname) < 0) {
+        close(fd);
+        delete[] localname;
+        throw -errno;
+    }
+
+    delete[] localname;
     return fd;
 }
-

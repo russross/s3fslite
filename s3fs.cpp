@@ -900,8 +900,8 @@ int my_fuse_opt_proc(void *data, const char *arg,
             AWSSecretAccessKey = strchr(arg, '=') + 1;
             return 0;
         }
-        if (strstr(arg, "default_acl=") != 0) {
-            default_acl = strchr(arg, '=') + 1;
+        if (strstr(arg, "default_acl=") != 0 || strstr(arg, "acl=") != 0) {
+            acl = strchr(arg, '=') + 1;
             return 0;
         }
         if (strstr(arg, "retries=") != 0) {
@@ -922,6 +922,10 @@ int my_fuse_opt_proc(void *data, const char *arg,
         }
         if (strstr(arg, "attr_cache=") != 0) {
             attr_cache = strchr(arg, '=') + 1;
+            return 0;
+        }
+        if (strstr(arg, "writeback_cache=") != 0) {
+            writeback_cache = strchr(arg, '=') + 1;
             return 0;
         }
     }

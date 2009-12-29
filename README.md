@@ -197,12 +197,13 @@ The complete list of supported options is:
 *   `secretAccessKey=` specify the Amazon AWS secret access key (no
     default)
 
-*   `default_acl=` specify the access control level for files
-    (default `public-read` for files with public read permissions,
-    `private` for everything else).
+*   `acl=` specify the access control level for files (default
+    `public-read` for files with public read permissions, `private`
+    for everything else).
 
 *   `retries=` specify the maximum number of times a failed/timed
-    out request should be retried (default `2`)
+    out request should be retried in addition to the initial attempt
+    (default `2`)
 
 *   `connect_timeout=` specify the timeout interval for request
     connections (default `2`)
@@ -218,6 +219,12 @@ The complete list of supported options is:
 *   `attr_cache=` specify the directory where the attribute cache
     database should be created and accessed (default current
     directory)
+
+*   `writeback_cache=` specify the directory where the write-back
+    cache temporary files should be created (default `/tmp`). Files
+    are unlinked as soon as they are created, so you will not
+    generally see anything listed in the given directory, but the
+    storage of that file system will still be used.
 
 
 Changes from s3fs

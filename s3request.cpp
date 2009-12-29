@@ -47,8 +47,8 @@ std::string lookupMimeType(std::string path) {
 }
 
 std::string getAcl(mode_t mode) {
-    if (default_acl != "")
-        return default_acl;
+    if (acl != "")
+        return acl;
     if (mode & S_IROTH)
         return public_acl;
     return private_acl;
