@@ -2,6 +2,8 @@
 #include <time.h>
 #include <fcntl.h>
 #include <strings.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
 #include "fileinfo.h"
 
