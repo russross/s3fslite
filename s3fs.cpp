@@ -1023,6 +1023,13 @@ int main(int argc, char *argv[]) {
 
     attrcache = new Attrcache(bucket, attr_cache);
 
+    // form the host URL
+    // if it contains "%s", replace it with the bucket name
+    // if not, assume it already has the bucket name embedded
+    size_t found = host.find("%s");
+    if (found != std::string::npos)
+        host.replace(found, 2, bucket);
+
     int status =
         fuse_main(custom_args.argc, custom_args.argv, &s3fs_oper, NULL);
 

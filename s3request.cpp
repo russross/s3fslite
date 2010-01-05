@@ -262,13 +262,14 @@ S3request::S3request(std::string path, std::string query) {
 
     std::string url;
 
-    // readdir requests need special treatment
+    // the resource is part of the signature, the url the actual object url
     if (query == "") {
         resource = urlEncode("/" + bucket + path);
-        url = host + resource;
+        url = host + urlEncode(path);
     } else {
-        resource = urlEncode("/" + bucket);
-        url = host + resource + "?" + query;
+        // readdir requests need special treatment
+        resource = urlEncode("/" + bucket + "/");
+        url = host + "/?" + query;
     }
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());

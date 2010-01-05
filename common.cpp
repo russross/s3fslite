@@ -13,7 +13,7 @@
 std::string bucket;
 std::string AWSAccessKeyId;
 std::string AWSSecretAccessKey;
-std::string host("http://s3.amazonaws.com");
+std::string host("http://%s.s3.amazonaws.com");
 mode_t root_mode = 0755;
 std::string attr_cache;
 std::string writeback_cache("/tmp");
