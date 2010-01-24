@@ -129,6 +129,12 @@ void Transaction::getExisting(std::string path) {
         // assume it doesn't exist to cache a negative hit
         file->exists = false;
         file->deleted = true;
+
+        // do we trust that the attr cache knows about every file?
+        if (attr_cache_complete == "true")
+            throw -ENOENT;
+
+        // no--check with the server
         file->info = S3request::get_fileinfo(path);
 
         // oh.. it must exist
@@ -926,6 +932,10 @@ int my_fuse_opt_proc(void *data, const char *arg,
         }
         if (strstr(arg, "attr_cache=") != 0) {
             attr_cache = strchr(arg, '=') + 1;
+            return 0;
+        }
+        if (strstr(arg, "attr_cache_complete=") != 0) {
+            attr_cache_complete = strchr(arg, '=') + 1;
             return 0;
         }
         if (strstr(arg, "writeback_cache=") != 0) {

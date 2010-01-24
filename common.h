@@ -44,5 +44,6 @@ extern std::string AWSAccessKeyId;
 extern std::string AWSSecretAccessKey;
 extern std::string host;
 extern std::string attr_cache;
+extern std::string attr_cache_complete;
 extern std::string writeback_cache;
 extern mode_t root_mode;
