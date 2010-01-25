@@ -266,7 +266,12 @@ void *flush_loop(void *param) {
     while (!flush_shutdown) {
         Filecache *file = Filecache::from_queue();
         if (file) {
-            file->fsync();
+            try {
+                file->fsync();
+            } catch (int e) {
+                syslog(LOG_ERR, "flush_loop: fsync failed[%s]",
+                        file->path.c_str());
+            }
             file->release();
             delete file;
         } else {

@@ -165,7 +165,22 @@ size_t uploadCallback(void *data, size_t blockSize, size_t numBlocks,
         void *userPtr)
 {
     int *fd = static_cast<int *>(userPtr);
-    return read(*fd, data, blockSize * numBlocks);
+    size_t len = read(*fd, data, blockSize * numBlocks);
+    if (len != blockSize * numBlocks) {
+        syslog(LOG_INFO, "uploadCallback: short read [%u] != [%u]",
+                (unsigned) len, (unsigned) (blockSize * numBlocks));
+    }
+    return len;
+}
+
+// lseek the uploadCallback data
+int seekCallback(void *userPtr, curl_off_t offset, int origin) {
+    syslog(LOG_INFO, "seekCallback: offset[%llu]", (unsigned long long) offset);
+
+    int *fd = static_cast<int *>(userPtr);
+    if (lseek(*fd, (off_t) offset, origin) < 0)
+        return 1; // CURL_SEEKFUNC_FAIL
+    return 0; // CURL_SEEKFUNC_OK
 }
 
 // store data in a fd and compute the md5 on the fly
@@ -177,7 +192,12 @@ size_t downloadCallback(void *data, size_t blockSize, size_t numBlocks,
     // update the md5 sum
     file->add(static_cast<unsigned char *>(data), blockSize * numBlocks);
 
-    return write(file->fd, data, blockSize * numBlocks);
+    size_t len = write(file->fd, data, blockSize * numBlocks);
+    if (len != blockSize * numBlocks) {
+        syslog(LOG_INFO, "downloadCallback: short write [%u] != [%u]",
+                (unsigned) len, (unsigned) (blockSize * numBlocks));
+    }
+    return len;
 }
 
 // store received data in a string
@@ -567,9 +587,11 @@ void S3request::put_file(Fileinfo *info, int fd) {
         // start reading from the beginning of the file
         lseek(fd, 0, SEEK_SET);
 
-        // store the data and compute the md5sum
+        // upload the data, allowing seeks
         curl_easy_setopt(req.curl, CURLOPT_READDATA, &fd);
         curl_easy_setopt(req.curl, CURLOPT_READFUNCTION, uploadCallback);
+        curl_easy_setopt(req.curl, CURLOPT_SEEKDATA, &fd);
+        curl_easy_setopt(req.curl, CURLOPT_SEEKFUNCTION, seekCallback);
     }
 
     // set all the headers
