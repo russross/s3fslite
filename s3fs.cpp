@@ -947,7 +947,7 @@ int my_fuse_opt_proc(void *data, const char *arg,
 }
 
 int main(int argc, char *argv[]) {
-    bzero(&s3fs_oper, sizeof(s3fs_oper));
+    memset(&s3fs_oper, 0, sizeof(s3fs_oper));
 
     struct fuse_args custom_args = FUSE_ARGS_INIT(argc, argv);
     fuse_opt_parse(&custom_args, NULL, NULL, my_fuse_opt_proc);

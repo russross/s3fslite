@@ -1,6 +1,7 @@
 #include <string>
 #include <time.h>
 #include <fcntl.h>
+#include <string.h>
 #include <strings.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -30,7 +31,7 @@ void Fileinfo::set(std::string path, unsigned uid, unsigned gid,
 }
 
 void Fileinfo::toStat(struct stat *info) {
-    bzero(info, sizeof(struct stat));
+    memset(info, 0, sizeof(struct stat));
     info->st_nlink = 1;
     info->st_uid = uid;
     info->st_gid = gid;
