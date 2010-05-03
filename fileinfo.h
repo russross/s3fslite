@@ -3,8 +3,9 @@
 #include <string>
 #include <time.h>
 #include <fcntl.h>
-#include <unistd.h>
+#include <sys/types.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 class Fileinfo {
     public:
