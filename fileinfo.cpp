@@ -3,8 +3,9 @@
 #include <fcntl.h>
 #include <string.h>
 #include <strings.h>
-#include <unistd.h>
+#include <sys/types.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "fileinfo.h"
 

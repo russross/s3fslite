@@ -4,6 +4,9 @@
 #include <vector>
 #include <syslog.h>
 #include <errno.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "common.h"
 #include "fileinfo.h"
