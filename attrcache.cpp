@@ -26,6 +26,7 @@ Attrcache::Attrcache(std::string bucket, std::string prefix) {
     int rows;
     int columns;
     char *err;
+    char *query;
     int status;
 
     if (sqlite3_open(name.c_str(), &conn) != SQLITE_OK) {
@@ -34,7 +35,8 @@ Attrcache::Attrcache(std::string bucket, std::string prefix) {
         exit(-1);
     }
 
-    // create the table if it does not already exist
+    // create the tables if they do not already exist
+    // first, the main attribute table
     status = sqlite3_get_table(conn,
         "CREATE TABLE cache (\n"
         "    path VARCHAR(256) NOT NULL,\n"
@@ -51,6 +53,34 @@ Attrcache::Attrcache(std::string bucket, std::string prefix) {
         sqlite3_free_table(result);
     else
         sqlite3_free(err);
+
+    // second, the table of directories that are fully cached
+    status = sqlite3_get_table(conn,
+        "CREATE TABLE directories (\n"
+        "    path VARCHAR(256) NOT NULL,\n"
+        "    PRIMARY KEY (path)\n"
+        ")",
+        &result, &rows, &columns, &err);
+
+    if (status == SQLITE_OK)
+        sqlite3_free_table(result);
+    else
+        sqlite3_free(err);
+
+    // reset the list of directories known to be fully cached?
+    if (dir_cache_reset == "false")
+        return;
+
+    query = sqlite3_mprintf("DELETE FROM directories");
+    if (sqlite3_get_table(conn, query, &result, &rows, &columns, &err) ==
+            SQLITE_OK)
+    {
+        sqlite3_free_table(result);
+    } else {
+        std::cerr << "error resetting directory cache: " << err << std::endl;
+        sqlite3_free(err);
+    }
+    sqlite3_free(query);
 }
 
 Attrcache::~Attrcache() {
@@ -154,3 +184,83 @@ void Attrcache::del(std::string path) {
     sqlite3_free(query);
 }
 
+bool Attrcache::getdir(std::string path) {
+    char **data;
+    int rows;
+    int columns;
+    char *err;
+    char *query;
+
+    // perform the query
+    query = sqlite3_mprintf(
+        "SELECT path FROM directories WHERE path = '%q'",
+        path.c_str());
+    int status = sqlite3_get_table(conn, query, &data, &rows, &columns, &err);
+    sqlite3_free(query);
+
+    // error?
+    if (status != SQLITE_OK) {
+        syslog(LOG_ERR, "sqlite error[%s]", err);
+        sqlite3_free(err);
+        return false;
+    }
+
+    // no results?
+    if (rows == 0) {
+        sqlite3_free_table(data);
+        return false;
+    }
+
+    sqlite3_free_table(data);
+    return true;
+}
+
+void Attrcache::setdir(std::string path) {
+    char **result;
+    int rows;
+    int columns;
+    char *err;
+    char *query;
+
+    // make sure there isn't an existing entry
+    deldir(path);
+
+    query = sqlite3_mprintf(
+        "INSERT INTO directories (path)\n"
+        "VALUES ('%q')",
+        path.c_str());
+    if (sqlite3_get_table(conn, query, &result, &rows, &columns, &err) ==
+            SQLITE_OK)
+    {
+        sqlite3_free_table(result);
+    } else {
+        std::cerr << "set_directory error: " << err << std::endl;
+        sqlite3_free(err);
+    }
+    sqlite3_free(query);
+}
+
+void Attrcache::setdir(Fileinfo *info) {
+    setdir(info->path);
+}
+
+void Attrcache::deldir(std::string path) {
+    char **result;
+    int rows;
+    int columns;
+    char *err;
+    char *query;
+
+    query = sqlite3_mprintf(
+        "DELETE FROM directories WHERE path = '%q'",
+        path.c_str());
+    if (sqlite3_get_table(conn, query, &result, &rows, &columns, &err) ==
+            SQLITE_OK)
+    {
+        sqlite3_free_table(result);
+    } else {
+        std::cerr << "delete_directory error: " << err << std::endl;
+        sqlite3_free(err);
+    }
+    sqlite3_free(query);
+}

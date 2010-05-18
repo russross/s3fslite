@@ -14,10 +14,19 @@ class Attrcache {
 
     public:
         Attrcache(std::string bucket, std::string prefix);
+
+        // file attributes
         Fileinfo *get(std::string path);
         void set(std::string path, struct stat *info);
         void set(Fileinfo *info);
         void del(std::string path);
+
+        // directories for which every file is cached
+        bool getdir(std::string path);
+        void setdir(std::string path);
+        void setdir(Fileinfo *info);
+        void deldir(std::string path);
+
         ~Attrcache();
 };
 

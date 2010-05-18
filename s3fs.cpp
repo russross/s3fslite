@@ -42,6 +42,7 @@
 #include <syslog.h>
 #include <time.h>
 #include <pthread.h>
+#include <libgen.h>
 
 // FUSE
 #include <fuse.h>
@@ -128,12 +129,20 @@ void Transaction::getExisting(std::string path) {
         file->info = new Fileinfo(path, getuid(), getgid(),
                 root_mode | S_IFDIR, time(NULL), 0);
     } else {
-        // assume it doesn't exist to cache a negative hit
+        // assume it doesn't exist in order to cache a negative hit
         file->exists = false;
         file->deleted = true;
 
-        // do we trust that the attr cache knows about every file?
-        if (attr_cache_complete == "true")
+        // does the attr cache know about every file in this directory?
+        char *copy = new char[path.size() + 1];
+        if (!copy)
+            throw -EIO;
+        strcpy(copy, path.c_str());
+        std::string parent(dirname(copy));
+        delete[] copy;
+
+        // if so, the file does not exist, because it is not in the cache
+        if (dir_cache == "true" && attrcache->getdir(parent))
             throw -ENOENT;
 
         // no--check with the server
@@ -817,6 +826,13 @@ int s3fs_readdir(const char *path, void *buf,
         // sync everything inside the directory
         Filecache::sync();
 
+        // assume we have every entry cached and look for counterexamples
+        bool dir_cache_complete = true;
+        if (dir_cache == "true")
+            attrcache->deldir(path);
+        else
+            dir_cache_complete = false;
+
         filler(buf, ".", 0, 0);
         filler(buf, "..", 0, 0);
 
@@ -829,12 +845,29 @@ int s3fs_readdir(const char *path, void *buf,
                     MAX_KEYS_PER_DIR_REQUEST);
 
             for (size_t i = 0; i < entries.size(); i++) {
+                // check if this entry is in the attr cache
+                if (dir_cache_complete) {
+                    std::string fullpath(path);
+                    if (fullpath != "/")
+                        fullpath += "/";
+                    fullpath += entries[i];
+                    Fileinfo *info = attrcache->get(fullpath);
+                    if (info)
+                        delete info;
+                    else
+                        dir_cache_complete = false;
+                }
+
                 if (filler(buf, entries[i].c_str(), 0, 0)) {
                     syslog(LOG_ERR, "readdir: buffer full");
                     break;
                 }
             }
         }
+
+        // every entry in this directory has a matching attrcache entry
+        if (dir_cache_complete)
+            attrcache->setdir(path);
 
         return 0;
     } catch (int e) {
@@ -936,8 +969,12 @@ int my_fuse_opt_proc(void *data, const char *arg,
             attr_cache = strchr(arg, '=') + 1;
             return 0;
         }
-        if (strstr(arg, "attr_cache_complete=") != 0) {
-            attr_cache_complete = strchr(arg, '=') + 1;
+        if (strstr(arg, "dir_cache=") != 0) {
+            dir_cache = strchr(arg, '=') + 1;
+            return 0;
+        }
+        if (strstr(arg, "dir_cache_reset=") != 0) {
+            dir_cache_reset = strchr(arg, '=') + 1;
             return 0;
         }
         if (strstr(arg, "writeback_cache=") != 0) {
