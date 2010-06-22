@@ -224,6 +224,21 @@ The complete list of supported options is:
     database should be created and accessed (default current
     directory)
 
+*   `dir_cache=` enable/disable directory caching. With this
+    enabled, all metadata queries will be confined to the local
+    cache if the file system believes it has up-to-date entries for
+    every file in the directory. When creating a new file or trying
+    to open a file that does not exist, this saves a round trip to
+    the server. To decide if a directory is completely represented,
+    it checks each time a readdir operation is invoked to see if
+    every file the server names has a metadata cache entry. Future
+    readdir operations are also satisfied by the cache. (default
+    `false`).
+
+*   `dir_cache_reset=` force the list of completely cached
+    directories (see `dir_cache=` above) to be reset at file system
+    mount time (default `true').
+
 *   `writeback_cache=` specify the directory where the write-back
     cache temporary files should be created (default `/tmp`). Files
     are unlinked as soon as they are created, so you will not
@@ -250,8 +265,9 @@ This fork has the following changes:
     a round trip to the server. With it, everything happens locally
     until the final version is uploaded with all of its metadata.
 
-    To force a sync, do an `ls` in any directory. The `readdir` call
-    does a complete sync before retrieving the directory listing.
+    To force a sync, do an `ls` in the directory of interest. The
+    `readdir` call does a sync on every file in the directory before
+    retrieving the directory listing.
 
 *   File metadata is cached in a SQLite database for faster access.
     File systems do lots of `getattr` calls, and each one normally
