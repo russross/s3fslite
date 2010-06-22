@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <sqlite3.h>
 
+#include "common.h"
 #include "fileinfo.h"
 
 class Attrcache {
@@ -26,6 +27,7 @@ class Attrcache {
         void setdir(std::string path);
         void setdir(Fileinfo *info);
         void deldir(std::string path);
+        void readdir(std::string path, stringlist &list);
 
         ~Attrcache();
 };

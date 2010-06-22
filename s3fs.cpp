@@ -824,7 +824,32 @@ int s3fs_readdir(const char *path, void *buf,
         t.getExisting(path);
 
         // sync everything inside the directory
-        Filecache::sync();
+        Filecache::syncdir(path);
+
+        filler(buf, ".", 0, 0);
+        filler(buf, "..", 0, 0);
+
+        // can we read everything from the cache?
+        if (dir_cache == "true" && attrcache->getdir(path)) {
+#ifdef DEBUG
+            syslog(LOG_INFO, "readdir[%s] from cache", path);
+#endif
+
+            stringlist entries;
+            attrcache->readdir(path, entries);
+
+            for (size_t i = 0; i < entries.size(); i++) {
+                if (filler(buf, entries[i].c_str(), 0, 0)) {
+                    syslog(LOG_ERR, "readdir: buffer full");
+                    break;
+                }
+            }
+
+            return 0;
+        }
+
+        // need to ask S3 for a directory
+        // as we do so, check to see if all files are in the cache
 
         // assume we have every entry cached and look for counterexamples
         bool dir_cache_complete = true;
@@ -833,12 +858,10 @@ int s3fs_readdir(const char *path, void *buf,
         else
             dir_cache_complete = false;
 
-        filler(buf, ".", 0, 0);
-        filler(buf, "..", 0, 0);
-
         std::string marker;
         bool moretocome = true;
 
+        // read the directory a slice at a time
         while (moretocome) {
             stringlist entries;
             moretocome = S3request::get_directory(path, marker, entries,

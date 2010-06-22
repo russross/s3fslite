@@ -14,6 +14,7 @@
 
 std::string trim_spaces(const std::string &s);
 std::string trim_quotes(const std::string &s);
+bool in_directory(const char *path, const char *dir);
 unsigned long num(std::string value);
 unsigned long long longnum(std::string value);
 int create_tempfile();

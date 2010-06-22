@@ -1,3 +1,4 @@
+#include <cstring>
 #include <string>
 #include <map>
 #include <vector>
@@ -55,6 +56,32 @@ std::string trim_quotes(const std::string &s) {
     if (start == std::string::npos || end == std::string::npos)
         return "";
     return s.substr(start, end + 1 - start);
+}
+
+bool in_directory(const char *path, const char *dir) {
+    int dirlen = strlen(dir);
+
+    // root directory is a special case
+    if (!strcmp(dir, "/"))
+        dirlen = 0;
+
+    // pathname must start with the directory name as a prefix
+    if (strncmp(path, dir, dirlen))
+        return false;
+
+    // prefix must be followed by a /
+    if (path[dirlen] != '/')
+        return false;
+
+    // pathname must contain at least one character after the /
+    if (!path[dirlen + 1])
+        return false;
+
+    // pathname must not contain any other / characters
+    if (strchr(path + dirlen + 1, '/'))
+        return false;
+
+    return true;
 }
 
 unsigned long num(std::string value) {

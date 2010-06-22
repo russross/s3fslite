@@ -13,6 +13,20 @@
 
 Attrcache *attrcache;
 
+// implement a match function for sqlite
+// A match B is true if A is a file in the directory B
+static void dirmatch(sqlite3_context *c, int argc, sqlite3_value **argv) {
+    const char *a, *b;
+
+    b = (const char *) sqlite3_value_text(argv[0]);
+    a = (const char *) sqlite3_value_text(argv[1]);
+
+    if (in_directory(a, b))
+        sqlite3_result_int(c, 1);
+    else
+        sqlite3_result_int(c, 0);
+}
+
 //
 // SQLite attribute caching
 //
@@ -31,6 +45,15 @@ Attrcache::Attrcache(std::string bucket, std::string prefix) {
 
     if (sqlite3_open(name.c_str(), &conn) != SQLITE_OK) {
         std::cerr << "Can't open database: " << name << ": " <<
+            sqlite3_errmsg(conn) << std::endl;
+        exit(-1);
+    }
+
+    // install the match function
+    if (sqlite3_create_function(conn, "match", 2, SQLITE_UTF8, NULL,
+                dirmatch, NULL, NULL))
+    {
+        std::cerr << "Can't install 'match' function: " << 
             sqlite3_errmsg(conn) << std::endl;
         exit(-1);
     }
@@ -260,6 +283,32 @@ void Attrcache::deldir(std::string path) {
         sqlite3_free_table(result);
     } else {
         std::cerr << "delete_directory error: " << err << std::endl;
+        sqlite3_free(err);
+    }
+    sqlite3_free(query);
+}
+
+void Attrcache::readdir(std::string path, stringlist &list) {
+    char **data;
+    int rows;
+    int columns;
+    char *err;
+    char *query;
+
+    int prefixlen = path.size() + 1;
+
+    query = sqlite3_mprintf(
+        "SELECT path FROM cache WHERE path MATCH '%q'",
+        path.c_str());
+    if (sqlite3_get_table(conn, query, &data, &rows, &columns, &err) ==
+            SQLITE_OK)
+    {
+        for (int i = 1; i <= rows; i++)
+            list.push_back(&data[i][prefixlen]);
+
+        sqlite3_free_table(data);
+    } else {
+        std::cerr << "read_directory error: " << err << std::endl;
         sqlite3_free(err);
     }
     sqlite3_free(query);

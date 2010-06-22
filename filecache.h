@@ -29,6 +29,7 @@ class Filecache {
         static Filecache *from_queue();
         void fsync();
         static void sync();
+        static void syncdir(std::string path);
         static bool openfiles(std::string prefix);
 };
 

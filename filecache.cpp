@@ -234,6 +234,21 @@ void Filecache::sync() {
     }
 }
 
+void Filecache::syncdir(std::string path) {
+#ifdef DEBUG_CACHE
+    syslog(LOG_INFO, "Filecache::sync all in directory[%s]", path.c_str());
+#endif
+
+    for (std::map<std::string, Filecache *>::iterator
+            it = open_files.begin();
+            it != open_files.end();
+            it++)
+    {
+        if (in_directory(it->first.c_str(), path.c_str()))
+            it->second->fsync();
+    }
+}
+
 // return true if any files are currently open with the given prefix
 bool Filecache::openfiles(std::string prefix) {
 #ifdef DEBUG_CACHE
