@@ -296,6 +296,8 @@ void Attrcache::readdir(std::string path, stringlist &list) {
     char *query;
 
     int prefixlen = path.size() + 1;
+    if (path == "/")
+        prefixlen = 1;
 
     query = sqlite3_mprintf(
         "SELECT path FROM cache WHERE path MATCH '%q'",
