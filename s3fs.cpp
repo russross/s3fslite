@@ -1022,7 +1022,7 @@ int main(int argc, char *argv[]) {
     if (AWSSecretAccessKey.size() == 0) {
         std::string line;
         std::ifstream passwd("/etc/passwd-s3fs");
-        while (getline(passwd, line)) {
+        while (!getline(passwd, line).eof()) {
             if (line[0]=='#')
                 continue;
             size_t pos = line.find(':');
@@ -1078,7 +1078,7 @@ int main(int argc, char *argv[]) {
     // load the list of mime types
     std::string line;
     std::ifstream passwd("/etc/mime.types");
-    while (getline(passwd, line)) {
+    while (!getline(passwd, line).eof()) {
         if (line[0] == '#')
             continue;
         std::stringstream tmp(line);
