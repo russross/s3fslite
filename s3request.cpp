@@ -166,12 +166,7 @@ size_t uploadCallback(void *data, size_t blockSize, size_t numBlocks,
 {
     int *fd = static_cast<int *>(userPtr);
     size_t len = read(*fd, data, blockSize * numBlocks);
-#ifdef DEBUG_WIRE
-    if (len != blockSize * numBlocks) {
-        syslog(LOG_INFO, "uploadCallback: short read [%u] != [%u]",
-                (unsigned) len, (unsigned) (blockSize * numBlocks));
-    }
-#endif
+
     return len;
 }
 
