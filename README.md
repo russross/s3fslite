@@ -233,11 +233,11 @@ The complete list of supported options is:
     it checks each time a readdir operation is invoked to see if
     every file the server names has a metadata cache entry. Future
     readdir operations are also satisfied by the cache. (default
-    `false`).
+    `true`).
 
 *   `dir_cache_reset=` force the list of completely cached
     directories (see `dir_cache=` above) to be reset at file system
-    mount time (default `true').
+    mount time (default `true`).
 
 *   `writeback_cache=` specify the directory where the write-back
     cache temporary files should be created (default `/tmp`). Files

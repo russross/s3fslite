@@ -18,7 +18,7 @@ std::string AWSSecretAccessKey;
 std::string host("http://%s.s3.amazonaws.com");
 mode_t root_mode = 0755;
 std::string attr_cache;
-std::string dir_cache("false");
+std::string dir_cache("true");
 std::string dir_cache_reset("true");
 std::string writeback_cache("/tmp");
 int retries = 2;
