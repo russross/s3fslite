@@ -647,9 +647,9 @@ bool S3request::get_directory(std::string path, std::string &marker,
     std::string prefix;
 
     if (path != "/")
-        prefix = urlEncode(path.substr(1) + "/");
+        prefix = path.substr(1) + "/";
 
-    std::string query("prefix=" + prefix);
+    std::string query("prefix=" + urlEncode(prefix));
 
     if (!includeall)
         query += "&delimiter=/";
