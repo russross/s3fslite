@@ -1078,7 +1078,7 @@ int main(int argc, char *argv[]) {
     // load the list of mime types
     std::string line;
     std::ifstream passwd("/etc/mime.types");
-    while (!getline(passwd, line).eof()) {
+    while (passwd.good() && !getline(passwd, line).eof()) {
         if (line[0] == '#')
             continue;
         std::stringstream tmp(line);
