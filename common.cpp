@@ -85,7 +85,11 @@ bool in_directory(const char *path, const char *dir) {
 }
 
 unsigned long num(std::string value) {
-    return strtoul(value.c_str(), NULL, 10);
+    const char *cstr = value.c_str();
+    if (cstr[0] == '0')
+        return strtoul(value.c_str(), NULL, 8);
+    else
+        return strtoul(value.c_str(), NULL, 10);
 }
 
 unsigned long long longnum(std::string value) {
